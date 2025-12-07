@@ -1,0 +1,24 @@
+# Shared configuration for all workflows
+# This reusable workflow provides common matrix values to avoid duplication
+name: Config
+
+on:
+  workflow_call:
+    outputs:
+      build-targets:
+        description: 'JSON array of OS targets for building'
+        value: ${{ jobs.config.outputs.build-targets }}
+      python-versions:
+        description: 'JSON array of Python versions to test'
+        value: ${{ jobs.config.outputs.python-versions }}
+
+jobs:
+  config:
+    name: Load configuration
+    runs-on: ubuntu-latest
+    outputs:
+      # Note: Using macos-15 for libkrun bottle compatibility (arm64_tahoe)
+      build-targets: '["ubuntu-latest", "macos-15"]'
+      python-versions: '["3.10", "3.11", "3.12", "3.13"]'
+    steps:
+      - run: echo "Configuration loaded"

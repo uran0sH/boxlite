@@ -1,0 +1,19 @@
+[package]
+name = "libkrun-sys"
+version = "0.1.0"
+edition = "2021"
+authors = ["BoxLite Contributors"]
+description = "FFI bindings to libkrun and libkrunfw"
+license = "Apache-2.0"
+
+links = "krun"
+
+[build-dependencies]
+pkg-config = "0.3"
+num_cpus = "1.16"
+
+[dependencies]
+libc = "0.2"
+
+[features]
+default = []

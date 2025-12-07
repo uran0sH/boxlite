@@ -1,0 +1,70 @@
+[package]
+name = "boxlite"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Library-only sandbox runtime for Boxlite"
+links = "boxlite"
+
+[lib]
+name = "boxlite"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "boxlite-shim"
+path = "src/bin/shim.rs"
+
+[features]
+default = ["gvproxy-backend"]
+libslirp-backend = []  # Uses external libslirp-helper binary, no Rust crate needed
+gvproxy-backend = ["dep:libgvproxy-sys"]   # Uses libgvproxy CGO shared library, links via FFI
+
+[dependencies]
+boxlite-shared = { path = "../boxlite-shared" }
+thiserror = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+dirs = "5.0"
+tokio = { version = "1.37", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "time", "process", "io-util"] }
+serde_json = "1.0"
+futures = "0.3"
+async-stream = "0.3"
+tonic = "0.12"
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+uuid = { version = "1.10", features = ["v4"] }
+ulid = "1.1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "ansi"] }
+tracing-appender = "0.2"
+sysinfo = "0.30"
+libc = "0.2"
+md5 = "0.7"
+rayon = "1.10"
+inventory = "0.3"
+clap = { version = "4.5", features = ["derive"] }
+oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
+oci-spec = "0.6"
+tar = "0.4"
+flate2 = "1.0"
+sha2 = "0.10"
+xattr = "1.0"
+walkdir = "2.5"
+filetime = "0.2"
+tempfile = "3.8"
+libgvproxy-sys = { path = "deps/libgvproxy-sys", optional = true }
+libkrun-sys = { path = "deps/libkrun-sys" }
+tokio-stream = "0.1.17"
+term_size = "0.3"
+qcow2-rs = "0.1.6"
+
+[build-dependencies]
+pkg-config = "0.3"
+regex = "1"
+
+[dev-dependencies]

@@ -1,0 +1,11 @@
+{
+  "name": "boxlite",
+  "version": "0.1.0",
+  "description": "JavaScript/TypeScript bindings for Boxlite",
+  "main": "index.js",
+  "files": ["dist"],
+  "scripts": {
+    "build": "echo 'TODO: build napi addon'",
+    "test": "echo 'TODO'"
+  }
+}

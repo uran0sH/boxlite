@@ -1,0 +1,70 @@
+name: Lint and Format
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # Load shared configuration
+  config:
+    uses: ./.github/workflows/config.yml
+
+  rustfmt:
+    name: Check Rust formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Run Clippy on ${{ matrix.os }}
+    needs: config
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: ${{ fromJson(needs.config.outputs.build-targets) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools protobuf-compiler
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Run Clippy (Linux)
+        if: runner.os == 'Linux'
+        env:
+          LIBKRUN_SYS_STUB: "1"
+          LIBGVPROXY_SYS_STUB: "1"
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run Clippy (macOS)
+        if: runner.os == 'macOS'
+        env:
+          LIBKRUN_SYS_STUB: "1"
+          LIBGVPROXY_SYS_STUB: "1"
+        run: cargo clippy --workspace --all-targets --all-features --exclude boxlite-guest -- -D warnings

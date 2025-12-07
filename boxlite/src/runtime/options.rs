@@ -1,0 +1,95 @@
+//! Configuration for Boxlite.
+
+use crate::runtime::constants::dirs as const_dirs;
+use crate::runtime::constants::envs as const_envs;
+use dirs::home_dir;
+use std::path::PathBuf;
+/// Configuration options for BoxliteRuntime.
+///
+/// Users can create it with defaults and modify fields as needed.
+#[derive(Clone, Debug)]
+pub struct BoxliteOptions {
+    pub home_dir: PathBuf,
+}
+
+impl Default for BoxliteOptions {
+    fn default() -> Self {
+        let home_dir = std::env::var(const_envs::BOXLITE_HOME)
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let mut path = home_dir().unwrap_or_else(|| PathBuf::from("."));
+                path.push(const_dirs::BOXLITE_DIR);
+                path
+            });
+
+        Self { home_dir }
+    }
+}
+
+/// Options used when constructing a box.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct BoxOptions {
+    pub name: Option<String>,
+    pub cpus: Option<u8>,
+    pub memory_mib: Option<u32>,
+    pub working_dir: Option<String>,
+    pub env: Vec<(String, String)>,
+    pub rootfs: RootfsSpec,
+    pub volumes: Vec<VolumeSpec>,
+    pub network: NetworkSpec,
+    pub ports: Vec<PortSpec>,
+}
+
+/// How to populate the box root filesystem.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum RootfsSpec {
+    /// Pull/resolve this registry image reference.
+    Image(String),
+    /// Use an already prepared rootfs at the given host path.
+    RootfsPath(String),
+}
+
+impl Default for RootfsSpec {
+    fn default() -> Self {
+        Self::Image("alpine:latest".into())
+    }
+}
+
+/// Filesystem mount specification.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct VolumeSpec {
+    pub host_path: String,
+    pub guest_path: String,
+    pub read_only: bool,
+}
+
+/// Network isolation options.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum NetworkSpec {
+    #[default]
+    Isolated,
+    // Host,
+    // Custom(String),
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum PortProtocol {
+    #[default]
+    Tcp,
+    Udp,
+    // Sctp,
+}
+
+fn default_protocol() -> PortProtocol {
+    PortProtocol::Tcp
+}
+
+/// Port mapping specification (host -> guest).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct PortSpec {
+    pub host_port: Option<u16>, // None/0 => dynamically assigned
+    pub guest_port: u16,
+    #[serde(default = "default_protocol")]
+    pub protocol: PortProtocol,
+    pub host_ip: Option<String>, // Optional bind IP, defaults to 0.0.0.0/:: if None
+}

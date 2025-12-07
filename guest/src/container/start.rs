@@ -1,0 +1,229 @@
+//! OCI container creation and startup
+//!
+//! Provides setup, validation, and execution functions for starting containers.
+//! Separated from container.rs to group by lifecycle phase (Prepare → Execute).
+
+use super::spec;
+use boxlite_shared::errors::{BoxliteError, BoxliteResult};
+use libcontainer::container::builder::ContainerBuilder;
+use libcontainer::container::Container as LibContainer;
+use libcontainer::syscall::syscall::SyscallType;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+// ====================
+// Setup Functions (Prepare Phase)
+// ====================
+
+/// Validate container creation inputs
+pub(crate) fn validate_container_inputs(
+    rootfs: &Path,
+    entrypoint: &[String],
+    workdir: &Path,
+) -> BoxliteResult<()> {
+    if rootfs.as_os_str().is_empty() {
+        return Err(BoxliteError::Internal(
+            "Container rootfs path cannot be empty".to_string(),
+        ));
+    }
+
+    if entrypoint.is_empty() {
+        return Err(BoxliteError::Internal(
+            "Container entrypoint cannot be empty".to_string(),
+        ));
+    }
+
+    if workdir.as_os_str().is_empty() {
+        tracing::info!("Container working directory is empty, defaulting to '/'");
+    }
+
+    Ok(())
+}
+
+/// Generate unique container ID
+pub(crate) fn generate_container_id() -> String {
+    format!("boxlite-{}", uuid::Uuid::new_v4())
+}
+
+/// Create /etc/hosts and /etc/hostname files for the container
+pub(crate) fn create_hostname_files(bundle_path: &Path, _container_id: &str) -> BoxliteResult<()> {
+    const DEFAULT_HOSTNAME: &str = "boxlite";
+
+    // Create /etc/hostname
+    let hostname_path = bundle_path.join("hostname");
+    fs::write(&hostname_path, format!("{}\n", DEFAULT_HOSTNAME))
+        .map_err(|e| BoxliteError::Internal(format!("Failed to create hostname file: {}", e)))?;
+
+    // Create /etc/hosts with localhost and hostname entries
+    let hosts_path = bundle_path.join("hosts");
+    let hosts_content = format!(
+        "127.0.0.1\tlocalhost\n\
+         ::1\t\tlocalhost ip6-localhost ip6-loopback\n\
+         fe00::0\t\tip6-localnet\n\
+         ff00::0\t\tip6-mcastprefix\n\
+         ff02::1\t\tip6-allnodes\n\
+         ff02::2\t\tip6-allrouters\n\
+         127.0.1.1\t{}\n",
+        DEFAULT_HOSTNAME
+    );
+    fs::write(&hosts_path, hosts_content)
+        .map_err(|e| BoxliteError::Internal(format!("Failed to create hosts file: {}", e)))?;
+
+    tracing::debug!(
+        hostname = hostname_path.display().to_string(),
+        hosts = hosts_path.display().to_string(),
+        "Created hostname resolution files"
+    );
+
+    Ok(())
+}
+
+/// Prepare state directory for container runtime state
+pub(crate) fn prepare_state_directory(state_root: &Path) -> BoxliteResult<PathBuf> {
+    fs::create_dir_all(state_root).map_err(|e| {
+        BoxliteError::Internal(format!(
+            "Failed to create container state directory {}: {}",
+            state_root.display(),
+            e
+        ))
+    })?;
+
+    Ok(state_root.to_path_buf())
+}
+
+/// Create OCI bundle (config.json + rootfs reference)
+pub(crate) fn create_oci_bundle(
+    container_id: &str,
+    rootfs: &Path,
+    entrypoint: &[String],
+    env: &[String],
+    workdir: &Path,
+    bundle_root: &Path,
+) -> BoxliteResult<PathBuf> {
+    let bundle_path = bundle_root.join(container_id);
+
+    fs::create_dir_all(&bundle_path).map_err(|e| {
+        BoxliteError::Internal(format!(
+            "Failed to create OCI bundle directory {}: {}",
+            bundle_path.display(),
+            e
+        ))
+    })?;
+
+    // Create /etc/hosts and /etc/hostname files
+    // These will be bind-mounted into the container to provide hostname resolution
+    create_hostname_files(&bundle_path, container_id)?;
+
+    let spec = spec::create_oci_spec(
+        container_id,
+        rootfs
+            .to_str()
+            .ok_or_else(|| BoxliteError::Internal("Invalid rootfs path".to_string()))?,
+        entrypoint,
+        env,
+        workdir
+            .to_str()
+            .ok_or_else(|| BoxliteError::Internal("Invalid workdir path".to_string()))?,
+        &bundle_path,
+    )?;
+    let config_path = bundle_path.join("config.json");
+
+    spec.save(&config_path).map_err(|e| {
+        BoxliteError::Internal(format!(
+            "Failed to save OCI spec to {}: {}",
+            config_path.display(),
+            e
+        ))
+    })?;
+
+    tracing::info!(
+        container_id,
+        bundle_path = %bundle_path.display(),
+        "Created OCI bundle"
+    );
+
+    Ok(bundle_path)
+}
+
+// ====================
+// Execution Functions (Execute Phase)
+// ====================
+
+/// Create container using libcontainer (does not start it)
+pub(crate) fn create_container(
+    container_id: &str,
+    state_root: &Path,
+    bundle_path: &Path,
+) -> BoxliteResult<()> {
+    ContainerBuilder::new(container_id.to_string(), SyscallType::default())
+        .with_root_path(state_root)
+        .map_err(|e| BoxliteError::Internal(format!("Failed to set container root path: {}", e)))?
+        .validate_id()
+        .map_err(|e| BoxliteError::Internal(format!("Invalid container ID: {}", e)))?
+        .as_init(bundle_path)
+        .with_systemd(false)
+        .with_detach(true)
+        .build()
+        .map_err(|e| {
+            BoxliteError::Internal(format!(
+                "Failed to create container {} at bundle {}: {}",
+                container_id,
+                bundle_path.display(),
+                e
+            ))
+        })?;
+
+    tracing::info!(container_id, "Created OCI container");
+    Ok(())
+}
+
+/// Start the container (executes entrypoint)
+pub(crate) fn start_container(container_id: &str, state_root: &Path) -> BoxliteResult<()> {
+    let container_state_path = state_root.join(container_id);
+
+    let mut container = LibContainer::load(container_state_path.clone()).map_err(|e| {
+        BoxliteError::Internal(format!(
+            "Failed to load container {} from {}: {}",
+            container_id,
+            container_state_path.display(),
+            e
+        ))
+    })?;
+
+    container.start().map_err(|e| {
+        BoxliteError::Internal(format!("Failed to start container {}: {}", container_id, e))
+    })?;
+
+    tracing::info!(container_id, "Started OCI container");
+    Ok(())
+}
+
+// ====================
+// Cleanup Functions
+// ====================
+
+/// Remove bundle directory
+pub(crate) fn cleanup_bundle_directory(bundle_path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_dir_all(bundle_path) {
+        tracing::warn!(
+            bundle_path = %bundle_path.display(),
+            error = %e,
+            "Failed to remove bundle directory"
+        );
+    }
+}
+
+/// Load container status from libcontainer
+pub(crate) fn load_container_status(
+    container_state_path: &Path,
+) -> BoxliteResult<libcontainer::container::ContainerStatus> {
+    let container = LibContainer::load(container_state_path.to_path_buf()).map_err(|e| {
+        BoxliteError::Internal(format!(
+            "Failed to load container from {}: {}",
+            container_state_path.display(),
+            e
+        ))
+    })?;
+
+    Ok(container.status())
+}

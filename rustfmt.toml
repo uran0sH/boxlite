@@ -1,0 +1,23 @@
+# Rust formatting configuration for BoxLite
+# See: https://rust-lang.github.io/rustfmt/
+# Using only stable features for compatibility
+
+# Edition
+edition = "2021"
+
+# Maximum line width
+max_width = 100
+
+# Indentation
+tab_spaces = 4
+hard_tabs = false
+
+# Use field init shorthand if possible
+use_field_init_shorthand = true
+
+# Use try shorthand
+use_try_shorthand = true
+
+# Reorder imports and modules
+reorder_imports = true
+reorder_modules = true

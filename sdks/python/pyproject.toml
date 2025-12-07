@@ -1,0 +1,85 @@
+[project]
+name = "boxlite"
+version = "0.2.0.dev1"
+description = "Python bindings for Boxlite runtime"
+requires-python = ">=3.10"
+authors = [{ name = "Dorian Zheng" }]
+license = "Apache-2.0"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "boxlite"
+include = [{ path = "boxlite/runtime/**/*", format = "wheel" }]
+
+[tool.cibuildwheel]
+# https://cibuildwheel.pypa.io/en/stable/options/#archs
+# Always build for native architecture (default is "auto" which is same)
+archs = ["native"]
+# Build for Python 3.10+
+# build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = [
+    # Skip musllinux since: cannot produce proc-macro for `async-recursion v1.1.1` as
+    # the target `aarch64-unknown-linux-musl` does not support these crate types".
+    # The dependency is: boxlite → qcow2-rs → async-recursion
+    "*-musllinux*",
+]
+
+
+# Build BoxLite runtime before building wheels (runs once per platform)
+# Linux build strategy:
+# - Guest binary: Built on Ubuntu host BEFORE container (manylinux lacks musl packages)
+# - Shim binary: Built IN container (needs glibc 2.28 for manylinux compatibility)
+# - Libraries: Built IN container (libkrun, libkrunfw from source)
+before-all = ["""
+    set -ex  # Exit on error, print commands
+
+    # cibuildwheel runs from repository root
+    BOXLITE_ROOT=$(pwd)
+
+    # Run setup script (installs dependencies, such as Rust, Make, etc.)
+    make setup
+
+    # Source cargo env (Rust may have just been installed)
+    [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+
+    # Build runtime: on manylinux, reuse guest binary built on Ubuntu host
+    keep_guest_bin=0
+    if [[ -n "${AUDITWHEEL_PLAT:-}" && "$AUDITWHEEL_PLAT" == manylinux* ]]; then
+        echo "Building for $AUDITWHEEL_PLAT, reusing existing guest binary"
+        keep_guest_bin=1
+    fi
+    KEEP_GUEST_BIN=$keep_guest_bin make runtime
+
+    # Copy runtime to Python module for wheel packaging (preserve symlinks)
+    rm -rf $BOXLITE_ROOT/sdks/python/boxlite/runtime
+    cp -a $BOXLITE_ROOT/target/boxlite-runtime $BOXLITE_ROOT/sdks/python/boxlite/runtime
+    """]
+
+# Test the built wheel (optional, add tests later)
+test-command = "python -c 'import boxlite; print(boxlite.__version__)'"
+
+[tool.cibuildwheel.macos]
+# Fix "libkrunfw.4.dylib has a minimum target of 14.0" error
+environment = { MACOSX_DEPLOYMENT_TARGET = "14.0", _PYTHON_HOST_PLATFORM = "macosx_14_0_arm64", PATH = "$HOME/.cargo/bin:$PATH" }
+
+repair-wheel-command = ""  # Skip auditwheel repair
+
+[tool.cibuildwheel.linux]
+# Use manylinux_2_28 which has newer tooling (Make 4.x required for libkrunfw kernel builds)
+# Default is manylinux_2_28, but explicit for documentation
+# manylinux-x86_64-image = "manylinux_2_28"
+# manylinux-aarch64-image = "manylinux_2_28"
+
+# Set Rust and library paths
+environment = { PATH = "$CARGO_HOME:$PATH", PKG_CONFIG_PATH = "/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig", LD_LIBRARY_PATH = "/usr/local/lib64:/usr/local/lib" }
+
+# Retag wheel for PyPI compliance without bundling libs (we handle runtime deps ourselves)
+# Uses 'wheel tags' to change linux_x86_64 -> manylinux_2_28_x86_64
+repair-wheel-command = "pip install wheel && wheel tags --platform-tag manylinux_2_28_$(uname -m) {wheel} && mv $(dirname {wheel})/*manylinux*.whl {dest_dir}/"

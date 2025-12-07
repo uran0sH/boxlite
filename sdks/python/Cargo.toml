@@ -1,0 +1,22 @@
+[package]
+name = "boxlite-python"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Python bindings for Boxlite"
+
+[lib]
+name = "boxlite_python"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+
+[dependencies]
+boxlite = { path = "../../boxlite" }
+pyo3 = { version = "0.27.1", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
+tokio = { version = "1.37", features = ["sync"] }
+futures = "0.3"
+tracing = "0.1"

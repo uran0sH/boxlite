@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "boxlite",
+    "boxlite/deps/libgvproxy-sys",
+    "boxlite/deps/libkrun-sys",
+    "boxlite-shared",
+    "guest",
+    "sdks/c",
+    "sdks/python",
+]
+exclude = ["build/tmp", "target", ".venv", "examples/*/.venv"]
+
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0-dev"
+edition = "2024"
+authors = ["Dorian Zheng <https://github.com/dorianzheng>"]
+license = "Apache-2.0"

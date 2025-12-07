@@ -1,0 +1,283 @@
+syntax = "proto3";
+
+package boxlite.v1;
+
+// ============================================================================
+// Services
+// ============================================================================
+
+// Container lifecycle management
+service Container {
+  // Initialize OCI container (called after GuestInit)
+  // Starts the container with the provided configuration
+  rpc Init(ContainerInitRequest) returns (ContainerInitResponse);
+}
+
+// Guest agent management
+service Guest {
+  // Initialize guest environment (mounts, rootfs, network)
+  // MUST be called first after connection, before Container.Init
+  rpc Init(GuestInitRequest) returns (GuestInitResponse);
+
+  // Health check
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Shutdown guest agent gracefully
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+// Command execution
+service Execution {
+  // Start execution immediately.
+  rpc Exec(ExecRequest) returns (ExecResponse);
+
+  // Attach to stdout/stderr (output only).
+  rpc Attach(AttachRequest) returns (stream ExecOutput);
+
+  // Send stdin (optional).
+  rpc SendInput(stream ExecStdin) returns (SendInputAck);
+
+  // Wait for execution to complete (blocking).
+  rpc Wait(WaitRequest) returns (WaitResponse);
+
+  // Kill execution (send signal)
+  rpc Kill(KillRequest) returns (KillResponse);
+
+  // Resize TTY window (PTY executions only)
+  rpc ResizeTty(ResizeTtyRequest) returns (ResizeTtyResponse);
+}
+
+// ============================================================================
+// Guest Service Messages
+// ============================================================================
+
+message GuestInitRequest {
+  // Unified volume mounts (virtiofs + block devices)
+  repeated Volume volumes = 1;
+
+  // Rootfs initialization strategy
+  RootfsInit rootfs = 2;
+
+  // Network configuration (optional)
+  NetworkInit network = 3;
+}
+
+message GuestInitResponse {
+  oneof result {
+    GuestInitSuccess success = 1;
+    GuestInitError error = 2;
+  }
+}
+
+message GuestInitSuccess {}
+
+message GuestInitError {
+  string reason = 1;
+}
+
+// Unified volume mount specification
+message Volume {
+  string mount_point = 1; // where to mount in guest
+  oneof source {
+    VirtiofsSource virtiofs = 2;
+    BlockDeviceSource block_device = 3;
+  }
+}
+
+// Virtiofs volume source
+message VirtiofsSource {
+  string tag = 1; // virtiofs tag name
+}
+
+// Block device volume source
+message BlockDeviceSource {
+  string device = 1;           // device path (e.g., "/dev/vda")
+  Filesystem filesystem = 2;   // filesystem type
+}
+
+// Supported filesystem types
+enum Filesystem {
+  FILESYSTEM_UNSPECIFIED = 0;
+  FILESYSTEM_EXT4 = 1;
+}
+
+// Rootfs initialization strategy
+message RootfsInit {
+  oneof strategy {
+    MergedRootfs merged = 1;
+    OverlayRootfs overlay = 2;
+  }
+}
+
+// Single merged rootfs - already mounted via mounts list
+message MergedRootfs {
+  string path = 1; // path where rootfs is mounted (e.g., /rootfs)
+}
+
+// Overlayfs from layers - layers already mounted via mounts list
+message OverlayRootfs {
+  repeated string lower_dirs = 1; // paths to lower layers (bottom to top)
+  string upper_dir = 2;           // writable upper layer path
+  string work_dir = 3;            // overlayfs work dir path
+  string merged_dir = 4;          // final merged mount point
+  bool copy_layers = 5;           // if true, copy lower_dirs to disk first (fixes UID mapping)
+}
+
+// Network initialization
+message NetworkInit {
+  string interface = 1;        // interface name (e.g., "eth0")
+  optional string ip = 2;      // IP address (optional, use DHCP if not set)
+  optional string gateway = 3; // gateway address
+}
+
+message PingRequest {}
+
+message PingResponse {
+  string version = 1;  // Guest agent version
+}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {}
+
+// ============================================================================
+// Container Service Messages
+// ============================================================================
+
+message ContainerInitRequest {
+  ContainerConfig container_config = 1;
+
+  // OCI container state directory (e.g., "/boxlite/workspace/rw/states")
+  string state_root = 2;
+
+  // OCI container bundle directory (e.g., "/boxlite/workspace/rw/bundles")
+  string bundle_root = 3;
+}
+
+message ContainerInitResponse {
+  oneof result {
+    ContainerInitSuccess success = 1;
+    ContainerInitError error = 2;
+  }
+}
+
+message ContainerInitSuccess {
+  string container_id = 1;  // UUID assigned to the container
+}
+
+message ContainerInitError {
+  string reason = 1;
+}
+
+// Container configuration (OCI-derived, from image)
+message ContainerConfig {
+  // Entrypoint command (e.g., ["/bin/sh", "-c", "echo hello"])
+  repeated string entrypoint = 1;
+
+  // Environment variables (e.g., ["PATH=/usr/bin", "HOME=/root"])
+  repeated string env = 2;
+
+  // Working directory (e.g., "/app")
+  string workdir = 3;
+}
+
+// ============================================================================
+// Execution Service Messages
+// ============================================================================
+
+// Exec: start immediately
+message ExecRequest {
+  optional string execution_id = 1;
+  string program = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  string workdir = 5;
+  uint64 timeout_ms = 6;
+  optional TtyConfig tty = 7;  // If set, use PTY instead of pipes
+}
+
+// TTY configuration for interactive sessions
+message TtyConfig {
+  uint32 rows = 1;      // Terminal height
+  uint32 cols = 2;      // Terminal width
+  uint32 x_pixels = 3;  // Optional: pixel width
+  uint32 y_pixels = 4;  // Optional: pixel height
+}
+
+message ExecResponse {
+  string execution_id = 1;
+  uint32 pid = 2;
+  uint64 started_at_ms = 3;
+  optional ExecError error = 4; // if set, no process is running
+}
+
+message ExecError {
+  string reason = 1;
+  string detail = 2;
+}
+
+// Attach: output only
+message AttachRequest {
+  string execution_id = 1;
+}
+
+message ExecOutput {
+  oneof event {
+    Stdout stdout = 1;
+    Stderr stderr = 2;
+  }
+}
+
+message Stdout {
+  bytes data = 1;
+}
+
+message Stderr {
+  bytes data = 1;
+}
+
+// SendInput: client streaming stdin
+message ExecStdin {
+  string execution_id = 1;
+  bytes data = 2;
+  bool close = 3;
+}
+
+message SendInputAck {}
+
+// Wait for execution result (blocking)
+message WaitRequest {
+  string execution_id = 1;
+}
+
+message WaitResponse {
+  int32 exit_code = 1;    // set if exited normally
+  int32 signal = 2;       // set if terminated by signal
+  bool timed_out = 3;     // true if timeout triggered termination
+  uint64 duration_ms = 4; // set for finished process
+}
+
+// Kill execution (send signal)
+message KillRequest {
+  string execution_id = 1;
+  int32 signal = 2;  // Signal number (default: 9 = SIGKILL)
+}
+
+message KillResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+// Resize TTY window
+message ResizeTtyRequest {
+  string execution_id = 1;
+  uint32 rows = 2;
+  uint32 cols = 3;
+  uint32 x_pixels = 4;
+  uint32 y_pixels = 5;
+}
+
+message ResizeTtyResponse {
+  bool success = 1;
+  optional string error = 2;
+}
