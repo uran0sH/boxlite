@@ -56,14 +56,6 @@ impl ContainerService for GuestServer {
                 })),
             }));
         }
-        if config.workdir.is_empty() {
-            error!("Invalid container config: workdir cannot be empty");
-            return Ok(Response::new(ContainerInitResponse {
-                result: Some(container_init_response::Result::Error(ContainerInitError {
-                    reason: "Invalid container config: workdir cannot be empty".to_string(),
-                })),
-            }));
-        }
 
         info!("🚀 Starting OCI container with received configuration");
         debug!(
