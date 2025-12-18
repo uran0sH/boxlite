@@ -46,8 +46,8 @@ class ComputerBox(SimpleBox):
         self,
         cpu: int = const.COMPUTERBOX_CPUS,
         memory: int = const.COMPUTERBOX_MEMORY_MIB,
-        gui_http_port: int = const.GUI_HTTP_PORT,
-        gui_https_port: int = const.GUI_HTTPS_PORT,
+        gui_http_port: int = const.COMPUTERBOX_GUI_HTTP_PORT,
+        gui_https_port: int = const.COMPUTERBOX_GUI_HTTPS_PORT,
         runtime: Optional['Boxlite'] = None,
         **kwargs
     ):
@@ -64,18 +64,18 @@ class ComputerBox(SimpleBox):
         """
         user_env = kwargs.pop('env', [])
         default_env = [
-            ("DISPLAY", const.DISPLAY_NUMBER),
-            ("DISPLAY_SIZEW", str(const.DISPLAY_WIDTH)),
-            ("DISPLAY_SIZEH", str(const.DISPLAY_HEIGHT)),
-            ("SELKIES_MANUAL_WIDTH", str(const.DISPLAY_WIDTH)),
-            ("SELKIES_MANUAL_HEIGHT", str(const.DISPLAY_HEIGHT)),
+            ("DISPLAY", const.COMPUTERBOX_DISPLAY_NUMBER),
+            ("DISPLAY_SIZEW", str(const.COMPUTERBOX_DISPLAY_WIDTH)),
+            ("DISPLAY_SIZEH", str(const.COMPUTERBOX_DISPLAY_HEIGHT)),
+            ("SELKIES_MANUAL_WIDTH", str(const.COMPUTERBOX_DISPLAY_WIDTH)),
+            ("SELKIES_MANUAL_HEIGHT", str(const.COMPUTERBOX_DISPLAY_HEIGHT)),
             ("SELKIES_UI_SHOW_SIDEBAR", "false"),
         ]
 
         user_ports = kwargs.pop('ports', [])
         default_ports = [
-            (gui_http_port, const.GUI_HTTP_PORT),
-            (gui_https_port, const.GUI_HTTPS_PORT)
+            (gui_http_port, const.COMPUTERBOX_GUI_HTTP_PORT),
+            (gui_https_port, const.COMPUTERBOX_GUI_HTTPS_PORT)
         ]
 
         super().__init__(
@@ -109,7 +109,7 @@ class ComputerBox(SimpleBox):
 
             try:
                 exec_result = await self.exec("xwininfo", "-tree", "-root")
-                expected_size = f'{const.DISPLAY_WIDTH}x{const.DISPLAY_HEIGHT}'
+                expected_size = f'{const.COMPUTERBOX_DISPLAY_WIDTH}x{const.COMPUTERBOX_DISPLAY_HEIGHT}'
 
                 if 'xfdesktop' in exec_result.stdout and expected_size in exec_result.stdout:
                     logger.info(f"Desktop ready after {elapsed:.1f} seconds")
@@ -150,8 +150,8 @@ print(base64.b64encode(buffer.getvalue()).decode("utf-8"))
 
         return {
             "data": exec_result.stdout.strip(),
-            "width": const.DISPLAY_WIDTH,
-            "height": const.DISPLAY_HEIGHT,
+            "width": const.COMPUTERBOX_DISPLAY_WIDTH,
+            "height": const.COMPUTERBOX_DISPLAY_HEIGHT,
             "format": "png"
         }
 

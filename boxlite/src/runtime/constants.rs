@@ -121,10 +121,10 @@ pub mod fs_options {
 /// Virtual machine resource defaults
 pub mod vm_defaults {
     /// Default number of CPUs allocated to a Box
-    pub const DEFAULT_CPUS: u8 = 2;
+    pub const DEFAULT_CPUS: u8 = 1;
 
     /// Default memory in MiB allocated to a Box
-    pub const DEFAULT_MEMORY_MIB: u32 = 512;
+    pub const DEFAULT_MEMORY_MIB: u32 = 2048;
 }
 
 /// File naming patterns
