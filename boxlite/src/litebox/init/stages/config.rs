@@ -114,10 +114,7 @@ fn build_fs_shares(
 
     // Single "shared" virtiofs share for container directories
     // Guest mounts this to /run/boxlite/shared/
-    #[cfg(target_os = "linux")]
     shares.add(mount_tags::SHARED, layout.shared_dir(), false);
-    #[cfg(target_os = "macos")]
-    shares.add(mount_tags::SHARED, layout.mounts_dir().to_path_buf(), false);
 
     // Strategy-specific shares
     match rootfs_result {

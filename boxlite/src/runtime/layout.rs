@@ -3,6 +3,39 @@ use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 use boxlite_shared::layout::{GUEST_BASE, SharedGuestLayout, dirs as shared_dirs};
 use std::path::{Path, PathBuf};
 
+/// Configuration for filesystem layout behavior.
+///
+/// Controls platform-specific filesystem features like bind mounts.
+#[derive(Clone, Debug, Default)]
+pub struct FsLayoutConfig {
+    /// Whether bind mount is supported on this platform.
+    ///
+    /// - `true`: Use bind mount (mounts/ → shared/), expose shared/ to guest
+    /// - `false`: Skip bind mount, expose mounts/ directly to guest
+    bind_mount_supported: bool,
+}
+
+impl FsLayoutConfig {
+    /// Create a new config with bind mount support enabled.
+    pub fn with_bind_mount() -> Self {
+        Self {
+            bind_mount_supported: true,
+        }
+    }
+
+    /// Create a new config with bind mount support disabled.
+    pub fn without_bind_mount() -> Self {
+        Self {
+            bind_mount_supported: false,
+        }
+    }
+
+    /// Check if bind mount is supported.
+    pub fn is_bind_mount(&self) -> bool {
+        self.bind_mount_supported
+    }
+}
+
 // ============================================================================
 // FILESYSTEM LAYOUT (home directory)
 // ============================================================================
@@ -10,11 +43,12 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug)]
 pub struct FilesystemLayout {
     home_dir: PathBuf,
+    config: FsLayoutConfig,
 }
 
 impl FilesystemLayout {
-    pub fn new(home_dir: PathBuf) -> Self {
-        Self { home_dir }
+    pub fn new(home_dir: PathBuf, config: FsLayoutConfig) -> Self {
+        Self { home_dir, config }
     }
 
     pub fn home_dir(&self) -> &Path {
@@ -79,7 +113,7 @@ impl FilesystemLayout {
 
     /// Create a box layout for a specific box ID.
     pub fn box_layout(&self, box_id: &str) -> BoxFilesystemLayout {
-        BoxFilesystemLayout::new(self.boxes_dir().join(box_id))
+        BoxFilesystemLayout::new(self.boxes_dir().join(box_id), self.config.clone())
     }
 
     /// Create an image layout for the images directory.
@@ -117,12 +151,12 @@ impl FilesystemLayout {
 /// │   └── containers/
 /// │       └── {cid}/
 /// │           ├── image/      # Container image (lowerdir)
-/// │           ├── rw/
+/// │           ├── oberlayfs/
 /// │           │   ├── upper/  # Overlayfs upper
 /// │           │   └── work/   # Overlayfs work
 /// │           └── rootfs/     # Final rootfs (overlayfs merged)
-/// ├── shared/             # Guest-visible (bind mount/symlink → mounts/)
-/// ├── disk.qcow2          # Data disk
+/// ├── shared/             # Guest-visible (ro bind mount → mounts/)
+/// ├── root.qcow2          # Data disk
 /// └── console.log         # Kernel/init output
 /// ```
 #[derive(Clone, Debug)]
@@ -130,14 +164,17 @@ pub struct BoxFilesystemLayout {
     box_dir: PathBuf,
     /// SharedGuestLayout for the mounts/ directory (host writes here).
     shared_layout: SharedGuestLayout,
+    /// Filesystem layout configuration.
+    config: FsLayoutConfig,
 }
 
 impl BoxFilesystemLayout {
-    pub fn new(box_dir: PathBuf) -> Self {
+    pub fn new(box_dir: PathBuf, config: FsLayoutConfig) -> Self {
         let shared_layout = SharedGuestLayout::new(box_dir.join(shared_dirs::MOUNTS));
         Self {
             box_dir,
             shared_layout,
+            config,
         }
     }
 
@@ -188,9 +225,24 @@ impl BoxFilesystemLayout {
         SharedGuestLayout::new(guest_base)
     }
 
-    /// Mounts directory path: ~/.boxlite/boxes/{box_id}/mounts
-    pub fn mounts_dir(&self) -> &Path {
-        self.shared_layout.base()
+    /// Directory for host-side file preparation, exposed to guest via virtio-fs.
+    ///
+    /// The bind mount pattern (mounts/ → shared/) serves two purposes:
+    /// 1. Host writes to mounts/ with full read-write access
+    /// 2. Guest sees shared/ as read-only (bind mount with MS_RDONLY)
+    ///
+    /// This prevents guest from modifying host-prepared files while allowing
+    /// the host to update content at any time.
+    ///
+    /// Returns the appropriate directory based on bind mount configuration:
+    /// - `is_bind_mount = true`: Returns mounts/ (host writes here, bind-mounted to shared/)
+    /// - `is_bind_mount = false`: Returns shared/ directly (no bind mount available)
+    pub fn mounts_dir(&self) -> PathBuf {
+        if self.config.is_bind_mount() {
+            self.shared_layout.base().to_path_buf()
+        } else {
+            self.shared_dir()
+        }
     }
 
     /// Shared directory: ~/.boxlite/boxes/{box_id}/shared

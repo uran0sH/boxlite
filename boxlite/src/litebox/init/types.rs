@@ -149,9 +149,8 @@ pub struct FilesystemInput<'a> {
 /// Output from filesystem stage.
 pub struct FilesystemOutput {
     pub layout: BoxFilesystemLayout,
-    /// Bind mount handle for mounts/ → shared/ binding (Linux only).
+    /// Bind mount handle for mounts/ → shared/ binding.
     /// Kept alive for the duration of box lifecycle; cleaned up on drop.
-    /// On macOS, virtiofs doesn't handle symlinks, so we skip the bind mount.
     #[cfg(target_os = "linux")]
     pub _bind_mount: BindMountHandle,
 }

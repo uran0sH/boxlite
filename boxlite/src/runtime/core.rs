@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use crate::litebox::{BoxBuilder, LiteBox};
 use crate::runtime::constants::filenames;
 use crate::runtime::initrf::InitRootfs;
-use crate::runtime::layout::FilesystemLayout;
+use crate::runtime::layout::{FilesystemLayout, FsLayoutConfig};
 use crate::runtime::lock::RuntimeLock;
 use crate::runtime::options::{BoxOptions, BoxliteOptions, RootfsSpec};
 use crate::{
@@ -119,7 +119,13 @@ impl BoxliteRuntime {
         }
 
         // Prepare: All setup before point of no return
-        let layout = FilesystemLayout::new(options.home_dir.clone());
+        // Configure bind mount support based on platform
+        #[cfg(target_os = "linux")]
+        let fs_config = FsLayoutConfig::with_bind_mount();
+        #[cfg(not(target_os = "linux"))]
+        let fs_config = FsLayoutConfig::without_bind_mount();
+
+        let layout = FilesystemLayout::new(options.home_dir.clone(), fs_config);
 
         layout.prepare().map_err(|e| {
             BoxliteError::Storage(format!(

@@ -32,9 +32,8 @@ pub fn run(input: FilesystemInput<'_>) -> BoxliteResult<FilesystemOutput> {
     #[cfg(target_os = "linux")]
     let bind_mount = {
         use crate::fs::{BindMountConfig, create_bind_mount};
-        create_bind_mount(
-            &BindMountConfig::new(layout.mounts_dir(), &layout.shared_dir()).read_only(),
-        )?
+        let mounts_dir = layout.mounts_dir();
+        create_bind_mount(&BindMountConfig::new(&mounts_dir, &layout.shared_dir()).read_only())?
     };
 
     Ok(FilesystemOutput {
