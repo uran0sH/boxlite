@@ -1,6 +1,6 @@
 use crate::runtime::constants::dirs as const_dirs;
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
-use boxlite_shared::layout::{GUEST_BASE, SharedGuestLayout, dirs as shared_dirs};
+use boxlite_shared::layout::{SharedGuestLayout, dirs as shared_dirs};
 use std::path::{Path, PathBuf};
 
 /// Configuration for filesystem layout behavior.
@@ -214,15 +214,6 @@ impl BoxFilesystemLayout {
     /// Returns the SharedGuestLayout for accessing container directories.
     pub fn shared_layout(&self) -> &SharedGuestLayout {
         &self.shared_layout
-    }
-
-    /// SharedGuestLayout for guest-side paths.
-    ///
-    /// Returns a layout with base `/run/boxlite/shared` for constructing
-    /// paths that will be used inside the guest VM.
-    pub fn guest_shared_layout(&self) -> SharedGuestLayout {
-        let guest_base = format!("{}/{}", GUEST_BASE, shared_dirs::SHARED);
-        SharedGuestLayout::new(guest_base)
     }
 
     /// Directory for host-side file preparation, exposed to guest via virtio-fs.

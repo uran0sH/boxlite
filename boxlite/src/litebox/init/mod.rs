@@ -2,17 +2,17 @@
 //!
 //! ## Architecture
 //!
-//! Initialization is split into stages executed by `InitPipeline`:
+//! Initialization is split into 6 stages executed by `InitPipeline`:
 //!
 //! ```text
-//! Filesystem ─────┐
-//!                 │
-//! Rootfs ─────────┼──→ Config ──→ Spawn ──→ Guest
-//!                 │
-//! GuestRootfs ────┘
+//! 1. Filesystem ──────┐
+//!                     │
+//! 2. ContainerRootfs ─┼──→ 4. VmmConfig ──→ 5. Spawn ──→ 6. GuestInit
+//!                     │
+//! 3. GuestRootfs ─────┘
 //!
-//! Parallel:   [Filesystem, Rootfs, GuestRootfs]  (tokio::join!)
-//! Sequential: Config → Spawn → Guest
+//! Parallel:   [Filesystem, ContainerRootfs, GuestRootfs]
+//! Sequential: VmmConfig → Spawn → GuestInit
 //! ```
 //!
 //! `CleanupGuard` provides RAII cleanup on failure.

@@ -78,3 +78,5 @@ mod start;
 
 #[cfg(target_os = "linux")]
 pub use lifecycle::Container;
+#[cfg(target_os = "linux")]
+pub use spec::UserMount;

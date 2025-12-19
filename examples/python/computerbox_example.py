@@ -28,7 +28,8 @@ async def test_all_functions():
     """Test all ComputerBox functions."""
     print("=== ComputerBox - Testing All Functions ===\n")
 
-    async with boxlite.ComputerBox(cpu=2, memory=2048) as desktop:
+    async with boxlite.ComputerBox(cpu=2, memory=2048, volumes=[("/Users/zhengzhiquan/Downloads/boxlite-computer-config", "/config")]) as desktop:
+    # async with boxlite.ComputerBox(cpu=2, memory=2048) as desktop:
         print("✓ Desktop started\n")
 
         # 1. wait_until_ready()
@@ -40,6 +41,8 @@ async def test_all_functions():
         print("2. get_screen_size()")
         width, height = await desktop.get_screen_size()
         print(f"   ✓ Screen: {width}x{height}\n")
+
+        await asyncio.sleep(3600)
 
         # 3. screenshot()
         print("3. screenshot()")

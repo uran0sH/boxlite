@@ -18,8 +18,11 @@ use crate::vmm::{BlockDevice, BlockDevices, FsShares};
 pub struct FsShareEntry {
     pub tag: String,
     pub host_path: PathBuf,
-    pub guest_path: String,
+    /// Guest mount path. None = guest determines from tag.
+    pub guest_path: Option<String>,
     pub read_only: bool,
+    /// Optional container_id for convention-based paths.
+    pub container_id: Option<String>,
 }
 
 /// Tracked block device entry.
@@ -30,6 +33,7 @@ pub struct BlockDeviceEntry {
     pub device_path: String,
     pub disk_path: PathBuf,
     pub format: DiskFormat,
+    pub read_only: bool,
     pub guest_mount: Option<String>,
 }
 
@@ -65,18 +69,23 @@ impl GuestVolumeManager {
     }
 
     /// Add a virtiofs share.
+    ///
+    /// `guest_path`: Where to mount in guest. `None` = guest determines from tag.
+    /// `container_id`: For user volumes, enables convention-based paths.
     pub fn add_fs_share(
         &mut self,
         tag: &str,
         host_path: PathBuf,
-        guest_path: &str,
+        guest_path: Option<&str>,
         read_only: bool,
+        container_id: Option<String>,
     ) {
         self.fs_shares.push(FsShareEntry {
             tag: tag.to_string(),
             host_path,
-            guest_path: guest_path.to_string(),
+            guest_path: guest_path.map(String::from),
             read_only,
+            container_id,
         });
     }
 
@@ -87,6 +96,7 @@ impl GuestVolumeManager {
         &mut self,
         disk_path: &Path,
         format: DiskFormat,
+        read_only: bool,
         guest_mount: Option<&str>,
     ) -> String {
         let block_id = Self::block_id_from_index(self.next_block_index);
@@ -99,12 +109,14 @@ impl GuestVolumeManager {
             device_path: device_path.clone(),
             disk_path: disk_path.to_path_buf(),
             format,
+            read_only,
             guest_mount: guest_mount.map(String::from),
         });
 
         tracing::debug!(
             block_id = %block_id,
             disk = %disk_path.display(),
+            read_only = %read_only,
             guest_mount = ?guest_mount,
             "Added block device"
         );
@@ -128,6 +140,9 @@ impl GuestVolumeManager {
 
         let mut block_devices = BlockDevices::new();
         for entry in &self.block_devices {
+            // Map disk format to VMM block format:
+            // - Ext4 filesystem → Raw block image
+            // - Qcow2 → Qcow2 (COW format)
             let vmm_format = match entry.format {
                 DiskFormat::Ext4 => crate::vmm::DiskFormat::Raw,
                 DiskFormat::Qcow2 => crate::vmm::DiskFormat::Qcow2,
@@ -135,7 +150,7 @@ impl GuestVolumeManager {
             block_devices.add(BlockDevice {
                 block_id: entry.block_id.clone(),
                 disk_path: entry.disk_path.clone(),
-                read_only: false,
+                read_only: entry.read_only,
                 format: vmm_format,
             });
         }
@@ -151,10 +166,13 @@ impl GuestVolumeManager {
         let mut volumes = Vec::new();
 
         for entry in &self.fs_shares {
+            // Empty mount_point = guest determines from tag
+            let mount_point = entry.guest_path.as_deref().unwrap_or("");
             volumes.push(VolumeConfig::virtiofs(
                 &entry.tag,
-                &entry.guest_path,
+                mount_point,
                 entry.read_only,
+                entry.container_id.clone(),
             ));
         }
 

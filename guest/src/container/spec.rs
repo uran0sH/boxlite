@@ -12,10 +12,22 @@ use oci_spec::runtime::{
     RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
 
+/// User-specified bind mount for container
+#[derive(Debug, Clone)]
+pub struct UserMount {
+    /// Source path in guest VM
+    pub source: String,
+    /// Destination path in container
+    pub destination: String,
+    /// Read-only mount
+    pub read_only: bool,
+}
+
 /// Create OCI runtime specification with default configuration
 ///
 /// Builds an OCI spec with:
 /// - Standard mounts (/proc, /dev, /sys, etc.)
+/// - User-specified bind mounts (volumes)
 /// - Default capabilities (matching runc defaults)
 /// - Standard namespaces (pid, ipc, uts, mount)
 /// - UID/GID mappings for user namespace
@@ -34,10 +46,43 @@ pub fn create_oci_spec(
     env: &[String],
     workdir: &str,
     bundle_path: &Path,
+    user_mounts: &[UserMount],
 ) -> BoxliteResult<Spec> {
     let caps = build_default_capabilities()?;
     let namespaces = build_default_namespaces()?;
-    let mounts = build_standard_mounts(bundle_path)?;
+    let mut mounts = build_standard_mounts(bundle_path)?;
+
+    // Add user-specified bind mounts
+    for user_mount in user_mounts {
+        let options = if user_mount.read_only {
+            vec!["bind".to_string(), "ro".to_string()]
+        } else {
+            vec!["bind".to_string(), "rw".to_string()]
+        };
+
+        mounts.push(
+            MountBuilder::default()
+                .destination(&user_mount.destination)
+                .typ("bind")
+                .source(&user_mount.source)
+                .options(options)
+                .build()
+                .map_err(|e| {
+                    BoxliteError::Internal(format!(
+                        "Failed to build user mount {} → {}: {}",
+                        user_mount.source, user_mount.destination, e
+                    ))
+                })?,
+        );
+
+        tracing::debug!(
+            source = %user_mount.source,
+            destination = %user_mount.destination,
+            read_only = user_mount.read_only,
+            "Added user bind mount to OCI spec"
+        );
+    }
+
     let process = build_process_spec(entrypoint, env, workdir, caps)?;
     let root = build_root_spec(rootfs)?;
     let linux = build_linux_spec(container_id, namespaces)?;

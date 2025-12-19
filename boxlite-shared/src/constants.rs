@@ -46,11 +46,11 @@ pub mod executor {
 /// They must match between host (when creating shares) and guest (when mounting).
 pub mod mount_tags {
     /// Tag for prepared rootfs virtiofs share (merged mode)
-    pub const ROOTFS: &str = "rootfs";
+    pub const ROOTFS: &str = "BoxLiteContainer0Rootfs";
 
-    /// Tag for extracted layers directory (overlayfs mode)
-    pub const LAYERS: &str = "layers";
+    /// Tag for image layers directory (mounted at container's diff dir)
+    pub const LAYERS: &str = "BoxLiteContainer0Layers";
 
     /// Tag for shared container directory (contains overlayfs/ and rootfs/)
-    pub const SHARED: &str = "shared";
+    pub const SHARED: &str = "BoxLiteShared";
 }

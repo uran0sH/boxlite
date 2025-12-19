@@ -4,7 +4,7 @@
 
 use crate::service::server::GuestServer;
 use boxlite_shared::{
-    guest_init_response, rootfs_init, Guest as GuestService, GuestInitError, GuestInitRequest,
+    guest_init_response, Guest as GuestService, GuestInitError, GuestInitRequest,
     GuestInitResponse, GuestInitSuccess, PingRequest, PingResponse, ShutdownRequest,
     ShutdownResponse,
 };
@@ -17,8 +17,9 @@ impl GuestService for GuestServer {
     ///
     /// This must be called first after connection. It:
     /// 1. Mounts all volumes (virtiofs + block devices)
-    /// 2. Sets up rootfs (merged or overlayfs)
-    /// 3. Configures network (if specified)
+    /// 2. Configures network (if specified)
+    ///
+    /// Note: Rootfs setup is handled by Container.Init.
     async fn init(
         &self,
         request: Request<GuestInitRequest>,
@@ -38,6 +39,7 @@ impl GuestService for GuestServer {
         }
 
         // Step 1: Mount all volumes (virtiofs + block devices)
+        // Empty mount_point = guest determines path from tag
         info!("Mounting {} volumes", req.volumes.len());
         if let Err(e) = crate::storage::mount_volumes(&req.volumes) {
             error!("Failed to mount volumes: {}", e);
@@ -48,48 +50,7 @@ impl GuestService for GuestServer {
             }));
         }
 
-        // Step 2: Log rootfs strategy (actual mounting moved to Container.Init)
-        // Guest init only mounts volumes; overlayfs is created in container init
-        // to keep the merged directory on local tmpfs instead of virtiofs.
-        match req.rootfs {
-            Some(rootfs_init) => match rootfs_init.strategy {
-                Some(rootfs_init::Strategy::Merged(merged)) => {
-                    info!("Rootfs strategy: merged at {}", merged.path);
-                }
-                Some(rootfs_init::Strategy::Overlay(overlay)) => {
-                    info!(
-                        "Rootfs strategy: overlay ({} lower dirs, merged={})",
-                        overlay.lower_dirs.len(),
-                        overlay.merged_dir
-                    );
-                    // Overlayfs mounting is deferred to Container.Init
-                }
-                Some(rootfs_init::Strategy::Disk(disk_rootfs)) => {
-                    info!(
-                        "Rootfs strategy: disk ({} at {})",
-                        disk_rootfs.device, disk_rootfs.mount_point
-                    );
-                }
-                None => {
-                    error!("Missing rootfs strategy in init request");
-                    return Ok(Response::new(GuestInitResponse {
-                        result: Some(guest_init_response::Result::Error(GuestInitError {
-                            reason: "Missing rootfs strategy in init request".to_string(),
-                        })),
-                    }));
-                }
-            },
-            None => {
-                error!("Missing rootfs configuration in init request");
-                return Ok(Response::new(GuestInitResponse {
-                    result: Some(guest_init_response::Result::Error(GuestInitError {
-                        reason: "Missing rootfs configuration in init request".to_string(),
-                    })),
-                }));
-            }
-        }
-
-        // Step 3: Configure network (if specified)
+        // Step 2: Configure network (if specified)
         if let Some(network) = req.network {
             info!("Configuring network interface: {}", network.interface);
             if let Err(e) = crate::network::configure_network_from_config(

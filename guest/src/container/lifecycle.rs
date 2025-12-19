@@ -4,6 +4,7 @@
 //! Follows the OCI Runtime Specification.
 
 use super::command::ContainerCommand;
+use super::spec::UserMount;
 use super::{kill, start};
 use crate::layout::GuestLayout;
 use boxlite_shared::errors::BoxliteResult;
@@ -62,6 +63,7 @@ impl Container {
     /// - `entrypoint`: Command and arguments for container init process
     /// - `env`: Environment variables in "KEY=VALUE" format
     /// - `workdir`: Working directory inside container
+    /// - `user_mounts`: Bind mounts from guest VM paths into container
     ///
     /// # Errors
     ///
@@ -75,6 +77,7 @@ impl Container {
         entrypoint: Vec<String>,
         env: Vec<String>,
         workdir: impl AsRef<Path>,
+        user_mounts: Vec<UserMount>,
     ) -> BoxliteResult<Self> {
         let rootfs = rootfs.as_ref();
         let workdir = workdir.as_ref();
@@ -107,6 +110,7 @@ impl Container {
             &env,
             workdir,
             &layout.containers_dir(),
+            &user_mounts,
         )?;
 
         // Create and start container

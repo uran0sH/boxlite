@@ -3,16 +3,85 @@
 //!
 //! Handles OCI container lifecycle (Init RPC).
 
+use std::path::Path;
+
 use crate::service::server::GuestServer;
 use boxlite_shared::{
-    container_init_response, Container as ContainerService, ContainerInitError,
-    ContainerInitRequest, ContainerInitResponse, ContainerInitSuccess,
+    container_init_response, rootfs_init, Container as ContainerService, ContainerInitError,
+    ContainerInitRequest, ContainerInitResponse, ContainerInitSuccess, Filesystem, RootfsInit,
 };
 use nix::mount::{mount, MsFlags};
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
 
-use crate::container::Container;
+use crate::container::{Container, UserMount};
+use crate::layout::GuestLayout;
+use crate::storage::block_device::BlockDeviceMount;
+
+/// Prepare container rootfs based on the initialization strategy.
+///
+/// Handles three strategies:
+/// - Merged: Shared rootfs already exists (no-op)
+/// - Overlay: Bind-mount layers to diff dir, create overlayfs
+/// - Disk: Mount block device to shared rootfs
+fn prepare_rootfs(
+    rootfs_init: &RootfsInit,
+    container_id: &str,
+    shared_rootfs: &Path,
+    layout: &GuestLayout,
+) -> Result<(), String> {
+    match &rootfs_init.strategy {
+        Some(rootfs_init::Strategy::Merged(_)) => {
+            info!("Rootfs strategy: merged (using shared rootfs)");
+            // Shared rootfs already exists, nothing to do
+            Ok(())
+        }
+        Some(rootfs_init::Strategy::Overlay(overlay)) => {
+            info!(
+                "Rootfs strategy: overlay ({} layers, copy={})",
+                overlay.layer_names.len(),
+                overlay.copy_layers
+            );
+
+            // Bind-mount layers from convention-based path to container's diff dir
+            let container_layout = layout.shared().container(container_id);
+            let layers_source = container_layout.layers_dir();
+            let diff_dir = container_layout.diff_dir();
+
+            std::fs::create_dir_all(&diff_dir)
+                .map_err(|e| format!("Failed to create diff dir: {}", e))?;
+
+            mount(
+                Some(layers_source.as_path()),
+                &diff_dir,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(|e| format!("Failed to bind-mount layers to diff: {}", e))?;
+
+            // TODO: Create overlayfs and mount to shared_rootfs
+            Ok(())
+        }
+        Some(rootfs_init::Strategy::Disk(disk)) => {
+            info!("Rootfs strategy: disk (device={})", disk.device);
+
+            std::fs::create_dir_all(shared_rootfs)
+                .map_err(|e| format!("Failed to create shared rootfs directory: {}", e))?;
+
+            // Use Unspecified to skip formatting - the COW disk already contains the rootfs
+            BlockDeviceMount::mount(
+                Path::new(&disk.device),
+                shared_rootfs,
+                Filesystem::Unspecified,
+            )
+            .map_err(|e| format!("Failed to mount rootfs disk: {}", e))?;
+
+            Ok(())
+        }
+        None => Err("Missing rootfs strategy in Container.Init request".to_string()),
+    }
+}
 
 #[tonic::async_trait]
 impl ContainerService for GuestServer {
@@ -66,7 +135,7 @@ impl ContainerService for GuestServer {
         info!("🚀 Starting OCI container with received configuration");
 
         // Compute rootfs paths from container_id
-        // Shared rootfs: /run/boxlite/shared/containers/{cid}/rootfs (overlayfs mount)
+        // Shared rootfs: /run/boxlite/shared/containers/{cid}/rootfs
         // Bundle rootfs: /run/boxlite/containers/{cid}/rootfs (OCI bundle)
         let shared_rootfs = self.layout.shared().container(&container_id).rootfs_dir();
         let bundle_rootfs = self
@@ -80,6 +149,22 @@ impl ContainerService for GuestServer {
             return Ok(Response::new(ContainerInitResponse {
                 result: Some(container_init_response::Result::Error(ContainerInitError {
                     reason: format!("Failed to create bundle rootfs directory: {}", e),
+                })),
+            }));
+        }
+
+        // Handle rootfs initialization based on strategy
+        let rootfs_init = init_req
+            .rootfs
+            .ok_or_else(|| Status::invalid_argument("Missing rootfs in Container.Init request"))?;
+
+        if let Err(reason) =
+            prepare_rootfs(&rootfs_init, &container_id, &shared_rootfs, &self.layout)
+        {
+            error!("{}", reason);
+            return Ok(Response::new(ContainerInitResponse {
+                result: Some(container_init_response::Result::Error(ContainerInitError {
+                    reason,
                 })),
             }));
         }
@@ -100,6 +185,24 @@ impl ContainerService for GuestServer {
             }));
         }
 
+        // Convert proto BindMount to UserMount for OCI spec
+        // Construct full source path from convention: /run/boxlite/shared/containers/{id}/volumes/{name}
+        let guest_layout = boxlite_shared::layout::SharedGuestLayout::new("/run/boxlite/shared");
+        let container_layout = guest_layout.container(&container_id);
+
+        let user_mounts: Vec<UserMount> = init_req
+            .mounts
+            .iter()
+            .map(|m| {
+                let source = container_layout.volume_dir(&m.volume_name);
+                UserMount {
+                    source: source.to_string_lossy().to_string(),
+                    destination: m.destination.clone(),
+                    read_only: m.read_only,
+                }
+            })
+            .collect();
+
         debug!(
             entrypoint = ?config.entrypoint,
             workdir = %config.workdir,
@@ -107,6 +210,7 @@ impl ContainerService for GuestServer {
             shared_rootfs = %shared_rootfs.display(),
             bundle_rootfs = %bundle_rootfs.display(),
             container_id = %container_id,
+            user_mounts_count = user_mounts.len(),
             "Container configuration"
         );
 
@@ -117,6 +221,7 @@ impl ContainerService for GuestServer {
             config.entrypoint,
             config.env,
             &config.workdir,
+            user_mounts,
         ) {
             Ok(container) => {
                 // Verify container init process is running

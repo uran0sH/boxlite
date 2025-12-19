@@ -1,9 +1,8 @@
 //! Guest service interface.
 
 use boxlite_shared::{
-    BlockDeviceSource, BoxliteError, BoxliteResult, DiskRootfs, Filesystem, GuestClient,
-    GuestInitRequest, MergedRootfs, NetworkInit, OverlayRootfs, PingRequest, RootfsInit,
-    ShutdownRequest, VirtiofsSource, Volume, guest_init_response,
+    BlockDeviceSource, BoxliteError, BoxliteResult, Filesystem, GuestClient, GuestInitRequest,
+    NetworkInit, PingRequest, ShutdownRequest, VirtiofsSource, Volume, guest_init_response,
 };
 use tonic::transport::Channel;
 
@@ -23,19 +22,17 @@ impl GuestInterface {
     /// Initialize guest environment.
     ///
     /// This must be called first after connection, before Container.Init.
-    /// Sets up volumes (virtiofs + block devices), rootfs, and network.
+    /// Sets up volumes (virtiofs + block devices) and network.
     pub async fn init(&mut self, config: GuestInitConfig) -> BoxliteResult<()> {
         tracing::debug!("Sending GuestInit request");
         tracing::trace!(
             volumes = config.volumes.len(),
-            rootfs = ?config.rootfs,
             network = ?config.network,
             "Guest init configuration"
         );
 
         let request = GuestInitRequest {
             volumes: config.volumes.into_iter().map(|v| v.into_proto()).collect(),
-            rootfs: Some(config.rootfs.into_proto()),
             network: config.network.map(|n| NetworkInit {
                 interface: n.interface,
                 ip: n.ip,
@@ -81,8 +78,6 @@ impl GuestInterface {
 pub struct GuestInitConfig {
     /// Volumes to mount (virtiofs + block devices)
     pub volumes: Vec<VolumeConfig>,
-    /// Rootfs initialization strategy
-    pub rootfs: RootfsInitConfig,
     /// Network configuration (optional)
     pub network: Option<NetworkInitConfig>,
 }
@@ -97,6 +92,8 @@ pub enum VolumeConfig {
         /// Mount point in guest
         mount_point: String,
         read_only: bool,
+        /// Optional container_id for convention-based paths
+        container_id: Option<String>,
     },
     /// Block device mount
     BlockDevice {
@@ -115,11 +112,13 @@ impl VolumeConfig {
         tag: impl Into<String>,
         mount_point: impl Into<String>,
         read_only: bool,
+        container_id: Option<String>,
     ) -> Self {
         Self::Virtiofs {
             tag: tag.into(),
             mount_point: mount_point.into(),
             read_only,
+            container_id,
         }
     }
 
@@ -142,12 +141,14 @@ impl VolumeConfig {
                 tag,
                 mount_point,
                 read_only,
+                container_id,
             } => Volume {
                 mount_point,
                 source: Some(boxlite_shared::volume::Source::Virtiofs(VirtiofsSource {
                     tag,
                     read_only,
                 })),
+                container_id: container_id.unwrap_or_default(),
             },
             VolumeConfig::BlockDevice {
                 device,
@@ -161,81 +162,7 @@ impl VolumeConfig {
                         filesystem: filesystem.into(),
                     },
                 )),
-            },
-        }
-    }
-}
-
-/// Whether to copy layers to disk before creating overlayfs (default).
-/// This fixes UID mapping issues with virtiofs.
-/// Can be overridden per-overlay in RootfsInitConfig::Overlay.
-pub const COPY_LAYERS_DEFAULT: bool = true;
-
-/// Rootfs initialization strategy.
-#[derive(Debug)]
-pub enum RootfsInitConfig {
-    /// Single merged rootfs - already mounted via volumes list
-    Merged {
-        /// Path where rootfs is mounted in guest
-        path: String,
-    },
-    /// Overlayfs from multiple layers - layers already mounted via volumes list
-    Overlay {
-        /// Paths to lower layers (bottom to top)
-        lower_dirs: Vec<String>,
-        /// Upper directory path for writes
-        upper_dir: String,
-        /// Overlayfs work directory path
-        work_dir: String,
-        /// Final merged mount point
-        merged_dir: String,
-        /// Whether to copy layers to disk before overlayfs (default: true)
-        /// Set to false when using COW disks with pre-populated layers
-        copy_layers: bool,
-    },
-    /// Disk-based rootfs - block device mounted directly as container rootfs
-    /// Used when rootfs is baked into a disk image (ext4/qcow2) for faster boot
-    DiskImage {
-        /// Block device path (e.g., "/dev/vdb")
-        device: String,
-        /// Where to mount in guest (e.g., "/boxlite/workspace/rootfs")
-        mount_point: String,
-    },
-}
-
-impl RootfsInitConfig {
-    fn into_proto(self) -> RootfsInit {
-        match self {
-            RootfsInitConfig::Merged { path } => RootfsInit {
-                strategy: Some(boxlite_shared::rootfs_init::Strategy::Merged(
-                    MergedRootfs { path },
-                )),
-            },
-            RootfsInitConfig::Overlay {
-                lower_dirs,
-                upper_dir,
-                work_dir,
-                merged_dir,
-                copy_layers,
-            } => RootfsInit {
-                strategy: Some(boxlite_shared::rootfs_init::Strategy::Overlay(
-                    OverlayRootfs {
-                        lower_dirs,
-                        upper_dir,
-                        work_dir,
-                        merged_dir,
-                        copy_layers,
-                    },
-                )),
-            },
-            RootfsInitConfig::DiskImage {
-                device,
-                mount_point,
-            } => RootfsInit {
-                strategy: Some(boxlite_shared::rootfs_init::Strategy::Disk(DiskRootfs {
-                    device,
-                    mount_point,
-                })),
+                container_id: String::new(),
             },
         }
     }

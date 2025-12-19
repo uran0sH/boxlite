@@ -34,6 +34,15 @@ pub mod dirs {
 
     /// Overlayfs work directory name
     pub const WORK: &str = "work";
+
+    /// Overlayfs diff directory name (contains image layers)
+    pub const DIFF: &str = "diff";
+
+    /// Layers directory name (virtiofs source for image layers)
+    pub const LAYERS: &str = "layers";
+
+    /// Volumes directory name (contains user volumes)
+    pub const VOLUMES: &str = "volumes";
 }
 
 /// Guest base path (FHS-compliant).
@@ -49,9 +58,13 @@ pub const GUEST_BASE: &str = "/run/boxlite";
 /// ```text
 /// {root}/                    # shared/containers/{cid}/
 /// ├── overlayfs/
+/// │   ├── diff/              # Image layers (lower dirs for overlayfs)
 /// │   ├── upper/             # Overlayfs upper (writable layer)
 /// │   └── work/              # Overlayfs work directory
-/// └── rootfs/                # All rootfs strategies mount here
+/// ├── rootfs/                # All rootfs strategies mount here
+/// └── volumes/               # User volumes (virtiofs mounts)
+///     ├── {volume-name-1}/
+///     └── {volume-name-2}/
 /// ```
 #[derive(Clone, Debug)]
 pub struct SharedContainerLayout {
@@ -88,6 +101,13 @@ impl SharedContainerLayout {
         self.overlayfs_dir().join(dirs::WORK)
     }
 
+    /// Diff directory: {root}/overlayfs/diff
+    ///
+    /// Contains image layers (lower dirs for overlayfs).
+    pub fn diff_dir(&self) -> PathBuf {
+        self.overlayfs_dir().join(dirs::DIFF)
+    }
+
     /// Rootfs directory: {root}/rootfs
     ///
     /// All rootfs strategies (merged, overlayfs, disk image) mount here.
@@ -96,11 +116,35 @@ impl SharedContainerLayout {
         self.root.join(dirs::ROOTFS)
     }
 
+    /// Volumes directory: {root}/volumes
+    ///
+    /// Base directory for user volume mounts.
+    pub fn volumes_dir(&self) -> PathBuf {
+        self.root.join(dirs::VOLUMES)
+    }
+
+    /// Specific volume directory: {root}/volumes/{volume_name}
+    ///
+    /// Convention-based path for a specific user volume.
+    /// Both host and guest use this to construct volume mount paths.
+    pub fn volume_dir(&self, volume_name: &str) -> PathBuf {
+        self.volumes_dir().join(volume_name)
+    }
+
+    /// Layers directory: {root}/layers
+    ///
+    /// Source directory for image layers (virtiofs mount point).
+    /// Guest bind-mounts from here to diff_dir for overlayfs.
+    pub fn layers_dir(&self) -> PathBuf {
+        self.root.join(dirs::LAYERS)
+    }
+
     /// Prepare container directories.
     pub fn prepare(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(self.upper_dir())?;
         std::fs::create_dir_all(self.work_dir())?;
         std::fs::create_dir_all(self.rootfs_dir())?;
+        std::fs::create_dir_all(self.volumes_dir())?;
         Ok(())
     }
 }

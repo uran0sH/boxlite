@@ -7,14 +7,15 @@
 use crate::disk::create_ext4_from_dir;
 use crate::images::ContainerConfig;
 use crate::litebox::init::types::{
-    ContainerRootfsPrepResult, RootfsInput, RootfsOutput, USE_DISK_ROOTFS, USE_OVERLAYFS,
+    ContainerRootfsInput, ContainerRootfsOutput, ContainerRootfsPrepResult, USE_DISK_ROOTFS,
+    USE_OVERLAYFS,
 };
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 
 /// Pull image and prepare rootfs.
 ///
 /// **Single Responsibility**: Image pulling + rootfs preparation.
-pub async fn run(input: RootfsInput<'_>) -> BoxliteResult<RootfsOutput> {
+pub async fn run(input: ContainerRootfsInput<'_>) -> BoxliteResult<ContainerRootfsOutput> {
     let image_ref = match &input.options.rootfs {
         crate::runtime::options::RootfsSpec::Image(r) => r,
         crate::runtime::options::RootfsSpec::RootfsPath(_) => {
@@ -48,10 +49,9 @@ pub async fn run(input: RootfsInput<'_>) -> BoxliteResult<RootfsOutput> {
         container_config.merge_env(input.options.env.clone());
     }
 
-    Ok(RootfsOutput {
+    Ok(ContainerRootfsOutput {
         container_config,
         rootfs_result,
-        image,
     })
 }
 

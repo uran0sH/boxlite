@@ -2,17 +2,23 @@
 //!
 //! Manages bind mounts from guest VM paths into container namespace.
 //! Works with GuestVolumeManager to set up the underlying virtiofs shares.
+//!
+//! Uses convention-based paths following Kata pattern:
+//! - Host: Only tracks volume_name, doesn't know guest paths
+//! - Guest: Constructs paths from `/run/boxlite/shared/containers/{container_id}/volumes/{volume_name}`
 
 use std::path::PathBuf;
 
 use super::guest_volume::GuestVolumeManager;
 
 /// Container bind mount entry.
-#[allow(dead_code)]
+///
+/// Uses convention-based paths - guest constructs full path from volume_name:
+/// `/run/boxlite/shared/containers/{container_id}/volumes/{volume_name}`
 #[derive(Debug, Clone)]
 pub struct ContainerMount {
-    /// Source path in guest VM
-    pub source: String,
+    /// Volume name (guest constructs full path using convention)
+    pub volume_name: String,
     /// Destination path in container
     pub destination: String,
     /// Read-only mount
@@ -23,13 +29,11 @@ pub struct ContainerMount {
 ///
 /// Holds a reference to GuestVolumeManager and tracks bind mounts
 /// from guest VM paths into container namespace.
-#[allow(dead_code)]
 pub struct ContainerVolumeManager<'a> {
     guest: &'a mut GuestVolumeManager,
     container_mounts: Vec<ContainerMount>,
 }
 
-#[allow(dead_code)]
 impl<'a> ContainerVolumeManager<'a> {
     /// Create a new container volume manager.
     pub fn new(guest: &'a mut GuestVolumeManager) -> Self {
@@ -39,24 +43,46 @@ impl<'a> ContainerVolumeManager<'a> {
         }
     }
 
-    /// Add a volume visible to both guest and container.
+    /// Add a user volume using convention-based paths.
     ///
-    /// Sets up virtiofs share in guest, records bind mount for container.
+    /// Follows Kata pattern:
+    /// - Host: Only knows volume_name and virtiofs tag
+    /// - Proto: Sends volume_name + container_id to guest
+    /// - Guest: Constructs full path from convention + container_id + volume_name
+    /// - Container: Bind mount from guest path to user-specified container path
+    ///
+    /// Convention (guest-side only):
+    /// `/run/boxlite/shared/containers/{container_id}/volumes/{volume_name}`
+    ///
+    /// # Arguments
+    /// * `container_id` - Container ID for path construction
+    /// * `volume_name` - Volume identifier (e.g., "data", "config")
+    /// * `tag` - Virtiofs tag name (e.g., "uservol0")
+    /// * `host_path` - Path on host to share
+    /// * `container_path` - Mount point in container (user-specified)
+    /// * `read_only` - Whether the mount is read-only
     pub fn add_volume(
         &mut self,
+        container_id: &str,
+        volume_name: &str,
+        tag: &str,
         host_path: PathBuf,
-        guest_path: &str,
         container_path: &str,
         read_only: bool,
     ) {
-        // Add virtiofs share to guest
-        let tag = self.guest.next_auto_tag();
-        self.guest
-            .add_fs_share(&tag, host_path, guest_path, read_only);
+        // Add virtiofs share to guest with container_id
+        // Guest will mount at convention path: /run/boxlite/shared/containers/{container_id}/volumes/{tag}
+        self.guest.add_fs_share(
+            tag,
+            host_path,
+            None,
+            read_only,
+            Some(container_id.to_string()),
+        );
 
-        // Record container bind mount
+        // Record container bind mount - guest constructs source path from convention
         self.container_mounts.push(ContainerMount {
-            source: guest_path.to_string(),
+            volume_name: volume_name.to_string(),
             destination: container_path.to_string(),
             read_only,
         });
@@ -65,9 +91,10 @@ impl<'a> ContainerVolumeManager<'a> {
     /// Add a container bind mount directly.
     ///
     /// Use when guest path already exists (e.g., from block device mount).
-    pub fn add_bind(&mut self, guest_path: &str, container_path: &str, read_only: bool) {
+    #[allow(dead_code)]
+    pub fn add_bind(&mut self, volume_name: &str, container_path: &str, read_only: bool) {
         self.container_mounts.push(ContainerMount {
-            source: guest_path.to_string(),
+            volume_name: volume_name.to_string(),
             destination: container_path.to_string(),
             read_only,
         });

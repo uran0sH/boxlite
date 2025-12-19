@@ -6,23 +6,13 @@
 // Re-export shared constants from boxlite-core
 pub use boxlite_shared::constants::{container, mount_tags, network};
 
-/// Guest mount points (paths inside the guest)
-/// These are sent to the guest via GuestInitRequest.
+/// Guest mount points (paths inside the guest).
 ///
-/// Note: Container-specific paths (rootfs, rw, etc.) are derived from
-/// SharedGuestLayout via BoxFilesystemLayout::guest_shared_layout().
+/// Note: Host only knows BIN_DIR (for guest entrypoint).
+/// All other guest paths are determined by the guest based on tags.
 pub mod guest_paths {
-    /// Directory for layer mounts in guest (for overlay strategy)
-    pub const LAYERS_DIR: &str = "/run/boxlite/layers";
-
-    /// Guest binary directory
+    /// Guest binary directory (for guest entrypoint executable)
     pub const BIN_DIR: &str = "/boxlite/bin";
-
-    /// Mount point for writable disk in guest (data disk)
-    pub const DISK_MOUNT: &str = "/run/boxlite/data";
-
-    /// Mount point for init rootfs disk before pivot_root
-    pub const INIT_DISK_MOUNT: &str = "/mnt/init";
 }
 
 pub mod envs {

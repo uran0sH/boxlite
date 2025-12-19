@@ -94,6 +94,7 @@ pub(crate) fn create_oci_bundle(
     env: &[String],
     workdir: &Path,
     bundle_root: &Path,
+    user_mounts: &[spec::UserMount],
 ) -> BoxliteResult<PathBuf> {
     let bundle_path = bundle_root.join(container_id);
 
@@ -120,6 +121,7 @@ pub(crate) fn create_oci_bundle(
             .to_str()
             .ok_or_else(|| BoxliteError::Internal("Invalid workdir path".to_string()))?,
         &bundle_path,
+        user_mounts,
     )?;
     let config_path = bundle_path.join("config.json");
 
@@ -134,6 +136,7 @@ pub(crate) fn create_oci_bundle(
     tracing::info!(
         container_id,
         bundle_path = %bundle_path.display(),
+        user_mounts_count = user_mounts.len(),
         "Created OCI bundle"
     );
 
