@@ -112,26 +112,21 @@ fn build_fs_shares(
 ) -> BoxliteResult<FsShares> {
     let mut shares = FsShares::new();
 
-    // Single "shared" virtiofs share for container directories
-    // Guest mounts this to /run/boxlite/shared/
+    // Shared directory virtiofs - needed by all strategies for host-guest communication
     shares.add(mount_tags::SHARED, layout.shared_dir(), false);
 
     // Strategy-specific shares
-    match rootfs_result {
-        RootfsPrepResult::Merged(path) => {
-            shares.add(mount_tags::ROOTFS, path.clone(), false);
-        }
-        RootfsPrepResult::Layers { layers_dir, .. } => {
-            shares.add(mount_tags::LAYERS, layers_dir.clone(), true);
-            let container_layout = layout.shared_layout().container(container_id);
-            let container_root = container_layout.root();
-            fix_rootfs_permissions(container_root)?;
-            shares.add(mount_tags::SHARED, container_root.to_path_buf(), false);
-        }
-        RootfsPrepResult::DiskImage { .. } => {
-            // Rootfs is on block device, no virtiofs needed
-        }
+    if let RootfsPrepResult::Merged(path) = rootfs_result {
+        shares.add(mount_tags::ROOTFS, path.clone(), false);
+    } else if let RootfsPrepResult::Layers { layers_dir, .. } = rootfs_result {
+        shares.add(mount_tags::LAYERS, layers_dir.clone(), true);
+        let container_layout = layout.shared_layout().container(container_id);
+        let container_root = container_layout.root();
+        fix_rootfs_permissions(container_root)?;
+        // Override SHARED with container-specific path for Layers mode
+        shares.add(mount_tags::SHARED, container_root.to_path_buf(), false);
     }
+    // DiskImage: rootfs on block device, only needs SHARED (already added above)
 
     for vol in user_volumes {
         shares.add(&vol.tag, vol.host_path.clone(), vol.read_only);

@@ -59,21 +59,20 @@ fn build_guest_init_config(
     let upper_path = container_layout.upper_dir();
     let work_path = container_layout.work_dir();
 
-    let mut volumes = Vec::new();
-
     // Rootfs configuration - all strategies use the same rootfs path
     let rootfs_path_str = rootfs_path.to_str().unwrap().to_string();
     let upper_path_str = upper_path.to_str().unwrap().to_string();
     let work_path_str = work_path.to_str().unwrap().to_string();
 
+    // Shared directory virtiofs - needed by all strategies for host-guest communication
+    let mut volumes = vec![GuestVolumeConfig::virtiofs(
+        mount_tags::SHARED,
+        guest_layout.base().to_str().unwrap(),
+        false,
+    )];
+
     let rootfs = match rootfs_result {
         RootfsPrepResult::Merged(_) => {
-            // Virtiofs for shared directory
-            volumes.push(GuestVolumeConfig::virtiofs(
-                mount_tags::SHARED,
-                guest_layout.base().to_str().unwrap(),
-                false,
-            ));
             volumes.push(GuestVolumeConfig::virtiofs(
                 mount_tags::ROOTFS,
                 &rootfs_path_str,
@@ -84,13 +83,6 @@ fn build_guest_init_config(
             }
         }
         RootfsPrepResult::Layers { layer_names, .. } => {
-            // Virtiofs for shared directory
-            volumes.push(GuestVolumeConfig::virtiofs(
-                mount_tags::SHARED,
-                guest_layout.base().to_str().unwrap(),
-                false,
-            ));
-            // Layers via virtiofs, overlayfs in guest
             volumes.push(GuestVolumeConfig::virtiofs(
                 mount_tags::LAYERS,
                 guest_paths::LAYERS_DIR,
@@ -110,15 +102,13 @@ fn build_guest_init_config(
             }
         }
         RootfsPrepResult::DiskImage { .. } => {
-            // Disk-based rootfs: mount block device directly (no virtiofs needed)
-            // Device path comes from block device manager
             let device =
                 rootfs_device_path.expect("rootfs_device_path must be set for DiskImage mode");
 
             volumes.push(GuestVolumeConfig::block_device(
                 device,
                 &rootfs_path_str,
-                Filesystem::Unspecified, // Already formatted (COW of ext4 base)
+                Filesystem::Unspecified,
             ));
 
             RootfsInitConfig::DiskImage {
