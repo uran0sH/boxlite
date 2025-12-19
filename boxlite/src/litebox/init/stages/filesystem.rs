@@ -15,7 +15,7 @@ pub fn run(input: FilesystemInput<'_>) -> BoxliteResult<FilesystemOutput> {
         .runtime
         .non_sync_state
         .layout
-        .box_layout(input.box_id.as_str());
+        .box_layout(input.box_id.as_str(), input.isolate_mounts)?;
 
     layout.prepare()?;
 

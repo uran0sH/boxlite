@@ -31,7 +31,7 @@ impl FsLayoutConfig {
     }
 
     /// Check if bind mount is supported.
-    pub fn is_bind_mount(&self) -> bool {
+    pub fn is_bind_mount_supported(&self) -> bool {
         self.bind_mount_supported
     }
 }
@@ -112,8 +112,25 @@ impl FilesystemLayout {
     }
 
     /// Create a box layout for a specific box ID.
-    pub fn box_layout(&self, box_id: &str) -> BoxFilesystemLayout {
-        BoxFilesystemLayout::new(self.boxes_dir().join(box_id), self.config.clone())
+    pub fn box_layout(
+        &self,
+        box_id: &str,
+        isolate_mounts: bool,
+    ) -> BoxliteResult<BoxFilesystemLayout> {
+        let effective_isolate = isolate_mounts && self.config.is_bind_mount_supported();
+
+        if isolate_mounts && !effective_isolate {
+            tracing::warn!(
+                "Mount isolation requested but bind mounts are not supported on this system. \
+                 Falling back to shared directory without isolation."
+            );
+        }
+
+        Ok(BoxFilesystemLayout::new(
+            self.boxes_dir().join(box_id),
+            self.config.clone(),
+            effective_isolate,
+        ))
     }
 
     /// Create an image layout for the images directory.
@@ -166,15 +183,19 @@ pub struct BoxFilesystemLayout {
     shared_layout: SharedGuestLayout,
     /// Filesystem layout configuration.
     config: FsLayoutConfig,
+    /// Whether to use bind mount isolation for the mounts directory.
+    /// Only effective when bind mounts are supported on the system.
+    isolate_mounts: bool,
 }
 
 impl BoxFilesystemLayout {
-    pub fn new(box_dir: PathBuf, config: FsLayoutConfig) -> Self {
+    pub fn new(box_dir: PathBuf, config: FsLayoutConfig, isolate_mounts: bool) -> Self {
         let shared_layout = SharedGuestLayout::new(box_dir.join(shared_dirs::MOUNTS));
         Self {
             box_dir,
             shared_layout,
             config,
+            isolate_mounts,
         }
     }
 
@@ -226,10 +247,10 @@ impl BoxFilesystemLayout {
     /// the host to update content at any time.
     ///
     /// Returns the appropriate directory based on bind mount configuration:
-    /// - `is_bind_mount = true`: Returns mounts/ (host writes here, bind-mounted to shared/)
-    /// - `is_bind_mount = false`: Returns shared/ directly (no bind mount available)
+    /// - `is_bind_mount_supported && isolate_mounts = true`: Returns mounts/ (host writes here, bind-mounted to shared/)
+    /// - Otherwise: Returns shared/ directly (no bind mount available or not requested)
     pub fn mounts_dir(&self) -> PathBuf {
-        if self.config.is_bind_mount() {
+        if self.config.is_bind_mount_supported() && self.isolate_mounts {
             self.shared_layout.base().to_path_buf()
         } else {
             self.shared_dir()
