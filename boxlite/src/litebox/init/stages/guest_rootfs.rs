@@ -2,12 +2,12 @@
 //!
 //! Lazily initializes the bootstrap guest rootfs as a disk image (shared across all boxes).
 
+use crate::disk::create_ext4_from_dir;
 use crate::litebox::init::types::{GuestRootfsInput, GuestRootfsOutput};
 use crate::rootfs::RootfsBuilder;
 use crate::runtime::constants::images;
 use crate::runtime::guest_rootfs::{GuestRootfs, Strategy};
 use crate::util;
-use crate::volumes::create_ext4_from_dir;
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 
 /// Get or initialize bootstrap guest rootfs.

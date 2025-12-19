@@ -437,11 +437,7 @@ impl ImageStorage {
     ///
     /// Disk images are stored in `{images_dir}/disk-images/{digest}.{ext}`.
     /// This returns the path regardless of whether the file exists.
-    pub fn disk_image_path(
-        &self,
-        image_digest: &str,
-        format: crate::volumes::DiskFormat,
-    ) -> PathBuf {
+    pub fn disk_image_path(&self, image_digest: &str, format: crate::disk::DiskFormat) -> PathBuf {
         let filename = image_digest.replace(':', "-");
         self.layout
             .disk_images_dir()
@@ -454,8 +450,8 @@ impl ImageStorage {
     pub fn find_disk_image(
         &self,
         image_digest: &str,
-    ) -> Option<(PathBuf, crate::volumes::DiskFormat)> {
-        use crate::volumes::DiskFormat;
+    ) -> Option<(PathBuf, crate::disk::DiskFormat)> {
+        use crate::disk::DiskFormat;
 
         // Check for ext4 format first (most common for rootfs)
         let ext4_path = self.disk_image_path(image_digest, DiskFormat::Ext4);

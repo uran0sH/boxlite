@@ -3,6 +3,7 @@
 //! Builds InstanceSpec from prepared components.
 //! Includes disk creation (minimal I/O).
 
+use crate::disk::{BackingFormat, DiskFormat, Qcow2Helper};
 use crate::litebox::init::types::{
     ConfigInput, ConfigOutput, ResolvedVolume, RootfsPrepResult, resolve_user_volumes,
 };
@@ -10,7 +11,7 @@ use crate::net::{NetworkBackendConfig, NetworkBackendFactory};
 use crate::rootfs::operations::fix_rootfs_permissions;
 use crate::runtime::constants::{guest_paths, mount_tags};
 use crate::vmm::{Entrypoint, FsShares, InstanceSpec};
-use crate::volumes::{BackingFormat, BlockDeviceManager, DiskFormat, Qcow2Helper};
+use crate::volumes::BlockDeviceManager;
 use boxlite_shared::errors::BoxliteResult;
 use boxlite_shared::{BoxliteError, Transport};
 use std::collections::{HashMap, HashSet};
@@ -223,7 +224,7 @@ async fn create_disks(
     layout: &crate::runtime::layout::BoxFilesystemLayout,
     _image: &crate::images::ImageObject,
     rootfs_result: &RootfsPrepResult,
-) -> BoxliteResult<crate::volumes::Disk> {
+) -> BoxliteResult<crate::disk::Disk> {
     let qcow2_helper = Qcow2Helper::new();
     let disk_path = layout.disk_path();
 
@@ -267,7 +268,7 @@ fn create_guest_rootfs_disk(
     block_manager: &mut BlockDeviceManager,
 ) -> BoxliteResult<(
     crate::runtime::guest_rootfs::GuestRootfs,
-    Option<crate::volumes::Disk>,
+    Option<crate::disk::Disk>,
 )> {
     let mut guest_rootfs = guest_rootfs.clone();
 

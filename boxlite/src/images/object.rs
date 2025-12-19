@@ -176,7 +176,7 @@ impl ImageObject {
     ///
     /// Returns a persistent Disk if the cached disk image exists, None otherwise.
     /// Does not create a new disk image - use for cache lookups only.
-    pub async fn disk_image(&self) -> Option<crate::volumes::Disk> {
+    pub async fn disk_image(&self) -> Option<crate::disk::Disk> {
         let image_digest = self.compute_image_digest();
         self.store.disk_image(&image_digest).await
     }
@@ -187,8 +187,8 @@ impl ImageObject {
     /// The source disk is consumed and a new persistent Disk is returned.
     pub async fn install_disk_image(
         &self,
-        disk: crate::volumes::Disk,
-    ) -> boxlite_shared::BoxliteResult<crate::volumes::Disk> {
+        disk: crate::disk::Disk,
+    ) -> boxlite_shared::BoxliteResult<crate::disk::Disk> {
         let image_digest = self.compute_image_digest();
         self.store.install_disk_image(&image_digest, disk).await
     }

@@ -16,6 +16,7 @@ pub mod net;
 pub mod portal;
 pub mod vmm;
 
+mod disk;
 mod images;
 pub mod litebox;
 mod rootfs;

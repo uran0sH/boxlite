@@ -4,11 +4,11 @@
 //! - Disk-based: Creates ext4 disk image from merged layers (fast boot)
 //! - Overlayfs: Extracts layers for guest-side overlayfs (flexible)
 
+use crate::disk::create_ext4_from_dir;
 use crate::images::ContainerConfig;
 use crate::litebox::init::types::{
     RootfsInput, RootfsOutput, RootfsPrepResult, USE_DISK_ROOTFS, USE_OVERLAYFS,
 };
-use crate::volumes::create_ext4_from_dir;
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 
 /// Pull image and prepare rootfs.

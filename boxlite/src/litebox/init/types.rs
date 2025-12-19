@@ -2,6 +2,7 @@
 
 use crate::BoxID;
 use crate::controller::ShimController;
+use crate::disk::Disk;
 #[cfg(target_os = "linux")]
 use crate::fs::BindMountHandle;
 use crate::images::{ContainerConfig, ImageObject};
@@ -14,7 +15,6 @@ use crate::runtime::layout::BoxFilesystemLayout;
 use crate::runtime::options::{BoxOptions, VolumeSpec};
 use crate::runtime::types::ContainerId;
 use crate::vmm::VmmController;
-use crate::volumes::Disk;
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 use boxlite_shared::layout::SharedGuestLayout;
 use std::path::PathBuf;

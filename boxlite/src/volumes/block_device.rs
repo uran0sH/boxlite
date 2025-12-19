@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::DiskFormat;
+use crate::disk::DiskFormat;
 use crate::vmm::{BlockDevice, BlockDevices};
 
 /// Virtio block device identifier.
