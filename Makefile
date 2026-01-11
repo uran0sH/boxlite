@@ -161,7 +161,7 @@ dev\:node: runtime-debug
 # Run Rust tests (excludes guest and doctests)
 test:
 	@echo "🧪 Running Rust tests..."
-	@cargo test --workspace --exclude boxlite-guest --exclude boxlite-cli --lib --tests
+	@cargo test --workspace --exclude boxlite-guest --exclude boxlite-cli --lib --tests -- --test-threads=1
 
 # Run CLI integration tests (requires runtime environment)
 test\:cli: runtime-debug
