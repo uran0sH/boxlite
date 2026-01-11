@@ -19,6 +19,7 @@ try:
         ExecStdout,
         ExecStderr,
         BoxInfo,
+        BoxStateInfo,
         RuntimeMetrics,
         BoxMetrics,
     )
@@ -33,6 +34,7 @@ try:
         "ExecStdout",
         "ExecStderr",
         "BoxInfo",
+        "BoxStateInfo",
         "RuntimeMetrics",
         "BoxMetrics",
     ]
@@ -81,6 +83,32 @@ try:
 
     __all__.extend(["InteractiveBox"])
 except ImportError:
+    pass
+
+# Sync API (greenlet-based synchronous wrappers)
+# Requires greenlet: pip install boxlite[sync]
+try:
+    from .sync_api import (
+        SyncBoxlite,
+        SyncBox,
+        SyncExecution,
+        SyncExecStdout,
+        SyncExecStderr,
+        SyncSimpleBox,
+        SyncCodeBox,
+    )
+
+    __all__.extend([
+        "SyncBoxlite",
+        "SyncBox",
+        "SyncExecution",
+        "SyncExecStdout",
+        "SyncExecStderr",
+        "SyncSimpleBox",
+        "SyncCodeBox",
+    ])
+except ImportError:
+    # greenlet not installed - sync API not available
     pass
 
 # Get version from package metadata
