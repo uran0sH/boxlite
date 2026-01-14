@@ -8,6 +8,7 @@ use std::str::FromStr;
 pub mod controller;
 pub mod engine;
 pub mod factory;
+pub mod host_check;
 pub mod krun;
 pub mod registry;
 
