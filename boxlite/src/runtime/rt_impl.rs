@@ -87,6 +87,15 @@ impl RuntimeImpl {
     ///
     /// Performs all initialization: filesystem setup, locks, managers, and box recovery.
     pub fn new(options: BoxliteOptions) -> BoxliteResult<SharedRuntimeImpl> {
+        let vmm_support = crate::vmm::host_check::check_virtualization_support().map_err(|e| {
+            BoxliteError::Internal(format!("Failed to check virtualization support: {}", e))
+        })?;
+
+        tracing::info!(
+            reason = %vmm_support.reason,
+            "Virtualization support verified"
+        );
+
         // Validate Early: Check preconditions before expensive work
         if !options.home_dir.is_absolute() {
             return Err(BoxliteError::Internal(format!(
