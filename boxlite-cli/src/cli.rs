@@ -57,6 +57,15 @@ pub enum Commands {
 
     /// Remove one or more boxes
     Rm(crate::commands::rm::RmArgs),
+
+    /// Start one or more stopped boxes
+    Start(crate::commands::start::StartArgs),
+
+    /// Stop one or more running boxes
+    Stop(crate::commands::stop::StopArgs),
+
+    /// Restart one or more boxes
+    Restart(crate::commands::restart::RestartArgs),
 }
 
 // ============================================================================

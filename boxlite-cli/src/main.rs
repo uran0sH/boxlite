@@ -37,6 +37,9 @@ async fn main() {
         cli::Commands::Create(args) => commands::create::execute(args, &cli.global).await,
         cli::Commands::List(args) => commands::list::execute(args, &cli.global).await,
         cli::Commands::Rm(args) => commands::rm::execute(args, &cli.global).await,
+        cli::Commands::Start(args) => commands::start::execute(args, &cli.global).await,
+        cli::Commands::Stop(args) => commands::stop::execute(args, &cli.global).await,
+        cli::Commands::Restart(args) => commands::restart::execute(args, &cli.global).await,
     };
 
     if let Err(error) = result {

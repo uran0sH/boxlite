@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use assert_cmd::Command;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -12,10 +14,8 @@ static SHARED_HOME: OnceLock<PathBuf> = OnceLock::new();
 
 pub struct TestContext {
     pub cmd: Command,
-    #[allow(dead_code)]
     pub home: &'static PathBuf,
     // Hold the lock until the test is done
-    #[allow(dead_code)]
     pub _guard: MutexGuard<'static, ()>,
 }
 
@@ -27,6 +27,18 @@ impl TestContext {
         cmd.timeout(Duration::from_secs(60));
         cmd.arg("--home").arg(self.home);
         cmd
+    }
+
+    pub fn cleanup_box(&self, name: &str) {
+        let mut cmd = self.new_cmd();
+        cmd.args(["rm", "--force", name]);
+        let _ = cmd.ok();
+    }
+
+    pub fn cleanup_boxes(&self, names: &[&str]) {
+        for name in names {
+            self.cleanup_box(name);
+        }
     }
 }
 
@@ -43,9 +55,15 @@ pub fn boxlite() -> TestContext {
         std::fs::create_dir_all(&test_home).expect("Failed to create /tmp/bl directory");
 
         let home = test_home;
+        let bin_path = env!("CARGO_BIN_EXE_boxlite");
+
+        // Clean up any stale containers from previous interrupted test runs (Ctrl+C, kill, etc.)
+        eprintln!("Cleaning up stale containers...");
+        let _ = std::process::Command::new(bin_path)
+            .args(["--home", home.to_str().unwrap(), "rm", "-fa"])
+            .output();
 
         // Pre-pull test images to avoid Docker Hub rate limits
-        let bin_path = env!("CARGO_BIN_EXE_boxlite");
         eprintln!("Pre-pulling {} test image(s)...", TEST_IMAGES.len());
 
         for image in TEST_IMAGES {
@@ -67,7 +85,7 @@ pub fn boxlite() -> TestContext {
         home
     });
 
-    let bin_path = env!("CARGO_BIN_EXE_boxlite");
+    let bin_path: &str = env!("CARGO_BIN_EXE_boxlite");
     let mut cmd = Command::new(bin_path);
     // You can override this with .timeout(Duration::from_secs(N))
     cmd.timeout(Duration::from_secs(60));

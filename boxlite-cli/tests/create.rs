@@ -2,11 +2,6 @@ use predicates::prelude::*;
 
 mod common;
 
-fn cleanup(ctx: &common::TestContext, name: &str) {
-    let mut cmd = ctx.new_cmd();
-    let _ = cmd.args(["rm", name, "--force"]).ok();
-}
-
 #[test]
 fn test_create_basic() {
     let mut ctx = common::boxlite();
@@ -20,9 +15,8 @@ fn test_create_basic() {
 
 #[test]
 fn test_create_named() {
-    let name = "boxlite_create_named";
     let mut ctx = common::boxlite();
-    cleanup(&ctx, name);
+    let name = "create-named";
     ctx.cmd
         .arg("create")
         .arg("--name")
@@ -32,8 +26,7 @@ fn test_create_named() {
         .success()
         .stdout(predicate::str::is_match(r"^[0-9A-Z]{26}\n$").unwrap());
 
-    let mut cmd_dup = ctx.new_cmd();
-    cmd_dup
+    ctx.new_cmd()
         .arg("create")
         .arg("--name")
         .arg(name)
@@ -42,14 +35,13 @@ fn test_create_named() {
         .failure()
         .stderr(predicate::str::contains("already exists"));
 
-    cleanup(&ctx, name);
+    ctx.cleanup_box(name);
 }
 
 #[test]
-fn test_create_with_resources() {
-    let name = "boxlite_create_resources";
+fn test_create_resources() {
     let mut ctx = common::boxlite();
-    cleanup(&ctx, name);
+    let name = "create-resources";
 
     ctx.cmd
         .arg("create")
@@ -67,5 +59,5 @@ fn test_create_with_resources() {
         .assert()
         .success();
 
-    cleanup(&ctx, name);
+    ctx.cleanup_box(name);
 }

@@ -187,7 +187,7 @@ test\:node:
 # Run CLI integration tests (requires runtime environment)
 test\:cli: runtime-debug
 	@echo "🧪 Running CLI integration tests..."
-	@cargo test -p boxlite-cli --tests --no-fail-fast
+	@cargo test -p boxlite-cli --tests --no-fail-fast -- --test-threads=1
 
 # Format all Rust code
 fmt:
