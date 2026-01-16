@@ -105,6 +105,30 @@ build_guest_binary() {
         build_flag="--release"
     fi
     cargo build $build_flag --target "$GUEST_TARGET" -p boxlite-guest
+
+    # Verify guest binary is statically linked
+    local guest_binary="$PROJECT_ROOT/target/$GUEST_TARGET/$PROFILE/boxlite-guest"
+    local file_output
+    file_output=$(file "$guest_binary")
+    if echo "$file_output" | grep -q "dynamically linked"; then 
+        local musl_arch
+        musl_arch=$(echo "$GUEST_TARGET" | cut -d'-' -f1)
+        local musl_gcc="${musl_arch}-linux-musl-gcc"
+
+        print_error "boxlite-guest is dynamically linked, but must be statically linked"
+        echo ""
+        echo "❌ Error: The boxlite-guest binary must be statically linked."
+        echo ""
+        echo "The guest binary at $guest_binary is dynamically linked, which means"
+        echo "it depends on shared libraries that won't be available inside the VM."
+        echo ""
+        echo "🔧 To fix this issue:"
+        echo "  Check your $musl_gcc version:"
+        echo "  $ $musl_gcc --version"
+        echo "  Verify whether your C compiler is a gnu-gcc wrapper instead of true musl-gcc"
+        echo ""
+        exit 1
+    fi
 }
 
 # Copy binary to destination
