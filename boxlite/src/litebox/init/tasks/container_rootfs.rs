@@ -91,15 +91,25 @@ async fn run_container_rootfs(
 
         let disk = Disk::new(disk_path.clone(), DiskFormat::Qcow2, true);
 
-        let image_ref = match rootfs_spec {
-            RootfsSpec::Image(r) => r,
-            RootfsSpec::RootfsPath(_) => {
-                return Err(BoxliteError::Storage(
-                    "Direct rootfs paths not yet supported".into(),
-                ));
+        // Load container config
+        let image = match rootfs_spec {
+            RootfsSpec::Image(r) => pull_image(runtime, r).await?,
+            RootfsSpec::RootfsPath(path) => {
+                let bundle_dir = std::path::Path::new(path);
+
+                if !bundle_dir.exists() {
+                    return Err(BoxliteError::Storage(format!(
+                        "Rootfs path does not exist: {}",
+                        path
+                    )));
+                }
+
+                runtime
+                    .image_manager
+                    .load_from_local(bundle_dir.to_path_buf(), format!("local:{}", path))
+                    .await?
             }
         };
-        let image = pull_image(runtime, image_ref).await?;
         let image_config = image.load_config().await?;
         let mut container_image_config = ContainerImageConfig::from_oci_config(&image_config)?;
         if !env.is_empty() {
@@ -109,18 +119,27 @@ async fn run_container_rootfs(
         return Ok((container_image_config, disk));
     }
 
-    // Fresh start: pull image and prepare rootfs
-    let image_ref = match rootfs_spec {
-        RootfsSpec::Image(r) => r,
-        RootfsSpec::RootfsPath(_) => {
-            return Err(BoxliteError::Storage(
-                "Direct rootfs paths not yet supported".into(),
-            ));
+    // Fresh start: pull or load image
+    let image = match rootfs_spec {
+        RootfsSpec::Image(r) => pull_image(runtime, r).await?,
+        RootfsSpec::RootfsPath(path) => {
+            let bundle_dir = std::path::Path::new(path);
+
+            if !bundle_dir.exists() {
+                return Err(BoxliteError::Storage(format!(
+                    "Rootfs path does not exist: {}",
+                    path
+                )));
+            }
+
+            runtime
+                .image_manager
+                .load_from_local(bundle_dir.to_path_buf(), format!("local:{}", path))
+                .await?
         }
     };
 
-    let image = pull_image(runtime, image_ref).await?;
-
+    // Prepare rootfs from image
     let rootfs_result = if USE_DISK_ROOTFS {
         prepare_disk_rootfs(runtime, &image).await?
     } else if USE_OVERLAYFS {
@@ -131,14 +150,14 @@ async fn run_container_rootfs(
         ));
     };
 
-    let disk = create_cow_disk(&rootfs_result, layout, disk_size_gb)?;
-
     let image_config = image.load_config().await?;
     let mut container_image_config = ContainerImageConfig::from_oci_config(&image_config)?;
 
     if !env.is_empty() {
         container_image_config.merge_env(env.to_vec());
     }
+
+    let disk = create_cow_disk(&rootfs_result, layout, disk_size_gb)?;
 
     Ok((container_image_config, disk))
 }

@@ -18,8 +18,11 @@ use crate::images::manager::{ImageManifest, LayerInfo};
 use crate::images::storage::ImageStorage;
 use boxlite_shared::{BoxliteError, BoxliteResult};
 use oci_client::Reference;
-use oci_client::manifest::OciDescriptor;
+use oci_client::manifest::{
+    ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest as ClientOciImageManifest,
+};
 use oci_client::secrets::RegistryAuth;
+use oci_spec::image::MediaType;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -202,6 +205,185 @@ impl ImageStore {
     pub async fn list(&self) -> BoxliteResult<Vec<(String, CachedImage)>> {
         let inner = self.inner.read().await;
         inner.index.list_all()
+    }
+
+    /// Load an OCI image from a local directory.
+    ///
+    /// Reads OCI layout files (index.json, manifest blob) using oci-spec types
+    /// and returns an `ImageManifest`. Layers and configs are imported into the
+    /// image store using hard links.
+    ///
+    /// Expected structure:
+    ///   ```text
+    ///   {path}/
+    ///     oci-layout       - OCI layout specification file
+    ///     index.json       - OCI image index (references manifests)
+    ///     blobs/sha256/    - Content-addressed blobs
+    ///       {manifest_digest}
+    ///       {config_digest}
+    ///       {layer_digest_1}
+    ///       {layer_digest_2}
+    ///       ...
+    ///   ```
+    ///
+    /// # Arguments
+    /// * `path` - Path to local image directory
+    ///
+    /// # Returns
+    /// `ImageManifest` with layer digests and config digest
+    ///
+    /// # Errors
+    /// - If `path/index.json` or `path/oci-layout` doesn't exist
+    /// - If any referenced blob is missing
+    /// - If hard linking fails
+    pub async fn load_from_local(&self, path: std::path::PathBuf) -> BoxliteResult<ImageManifest> {
+        tracing::info!("Loading OCI image from local path: {}", path.display());
+
+        // 1. Validate OCI layout
+        let oci_layout_path = path.join("oci-layout");
+        if !oci_layout_path.exists() {
+            return Err(BoxliteError::Storage(format!(
+                "Local image must contain oci-layout file, not found at: {}",
+                oci_layout_path.display()
+            )));
+        }
+
+        // 2. Load and parse index.json using oci_client types
+        let index_path = path.join("index.json");
+        let index_json = std::fs::read_to_string(&index_path)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to read index.json: {}", e)))?;
+
+        let index: OciImageIndex = serde_json::from_str(&index_json)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to parse index.json: {}", e)))?;
+
+        // 3. Get first manifest descriptor
+        let manifest_desc = index
+            .manifests
+            .first()
+            .ok_or_else(|| BoxliteError::Storage("No manifests found in index.json".into()))?;
+
+        // 4. Resolve to ImageManifest (handles at most one level of ImageIndex)
+        let manifest_digest = self.get_image_manifest(&path, manifest_desc)?;
+
+        // 5. Parse ImageManifest to extract config and layers
+        let manifest_blob_path = path.join("blobs").join(manifest_digest.replace(':', "/"));
+
+        let (config_digest_str, layers) = self.parse_oci_manifest_from_path(
+            &manifest_blob_path,
+            &format!("image manifest {}", manifest_digest),
+        )?;
+
+        // 6. Import blobs (config and layers) into storage
+        self.import_oci_blobs(&path, &config_digest_str, &layers)
+            .await?;
+
+        tracing::info!(
+            "Loaded local OCI image: config={}, {} layers, manifest={}",
+            config_digest_str,
+            layers.len(),
+            manifest_digest
+        );
+
+        Ok(ImageManifest {
+            manifest_digest: manifest_digest.to_string(),
+            layers,
+            config_digest: config_digest_str,
+        })
+    }
+
+    /// Get an ImageManifest digest from the descriptor.
+    ///
+    /// Handles at most two levels (like containerd):
+    /// - index.json → ImageManifest (single platform)
+    /// - index.json → ImageIndex → ImageManifest (multi-platform)
+    ///
+    /// Note: While the OCI image index specification theoretically supports
+    /// arbitrary nesting, common implementations like containerd only support
+    /// at most one level of indirection.
+    ///
+    /// # Arguments
+    /// * `image_dir` - Base directory containing blobs/
+    /// * `descriptor` - Starting descriptor (may point to ImageIndex or ImageManifest)
+    ///
+    /// # Returns
+    /// The digest of the ImageManifest
+    fn get_image_manifest(
+        &self,
+        image_dir: &std::path::Path,
+        descriptor: &ImageIndexEntry,
+    ) -> BoxliteResult<String> {
+        // Check media type using string matching
+        let media_type = MediaType::from(descriptor.media_type.as_str());
+
+        match media_type {
+            MediaType::ImageIndex => {
+                tracing::info!("ImageIndex detected, selecting platform-specific manifest");
+
+                // Load the ImageIndex blob
+                let index_blob_path = image_dir
+                    .join("blobs")
+                    .join(descriptor.digest.replace(':', "/"));
+
+                if !index_blob_path.exists() {
+                    return Err(BoxliteError::Storage(format!(
+                        "ImageIndex blob not found: {}",
+                        index_blob_path.display()
+                    )));
+                }
+
+                let index_json = std::fs::read_to_string(&index_blob_path).map_err(|e| {
+                    BoxliteError::Storage(format!("Failed to read ImageIndex blob: {}", e))
+                })?;
+
+                let child_index: OciImageIndex =
+                    serde_json::from_str(&index_json).map_err(|e| {
+                        BoxliteError::Storage(format!("Failed to parse ImageIndex: {}", e))
+                    })?;
+
+                // Detect platform
+                let (platform_os, platform_arch) = Self::detect_platform();
+
+                tracing::debug!(
+                    "Selecting platform manifest: {}/{} (Rust arch: {})",
+                    platform_os,
+                    platform_arch,
+                    std::env::consts::ARCH
+                );
+
+                // Select platform-specific manifest descriptor using unified function
+                let platform_manifest =
+                    self.select_platform_manifest(&child_index, platform_os, platform_arch)?;
+
+                tracing::info!(
+                    "Selected platform-specific manifest: {}",
+                    platform_manifest.digest
+                );
+
+                // Verify the selected manifest is an ImageManifest (not another ImageIndex)
+                let platform_mt = MediaType::from(platform_manifest.media_type.as_str());
+                match platform_mt {
+                    MediaType::ImageIndex => Err(BoxliteError::Storage(format!(
+                        "Nested ImageIndex not supported (platform manifest {} is an ImageIndex, not ImageManifest)",
+                        platform_manifest.digest
+                    ))),
+                    _ => {
+                        tracing::debug!("Platform manifest is ImageManifest");
+                        Ok(platform_manifest.digest.clone())
+                    }
+                }
+            }
+            MediaType::ImageManifest => {
+                tracing::debug!(
+                    "ImageManifest found, returning digest: {}",
+                    descriptor.digest
+                );
+                Ok(descriptor.digest.clone())
+            }
+            _ => Err(BoxliteError::Storage(format!(
+                "Unsupported media type: {}. Expected ImageManifest or ImageIndex",
+                media_type
+            ))),
+        }
     }
 
     /// Load config JSON for an image.
@@ -824,6 +1006,161 @@ impl ImageStore {
             )));
         }
 
+        Ok(())
+    }
+
+    /// Parse OCI image manifest from file path.
+    ///
+    /// Reads an OCI ImageManifest from the given path and extracts
+    /// config digest and layer information.
+    ///
+    /// # Arguments
+    /// * `manifest_path` - Path to the manifest JSON file
+    /// * `context` - Description for error messages (e.g., "platform manifest", "image manifest")
+    ///
+    /// # Returns
+    /// Tuple of (config_digest_string, layers_vector)
+    fn parse_oci_manifest_from_path(
+        &self,
+        manifest_path: &std::path::Path,
+        context: &str,
+    ) -> BoxliteResult<(String, Vec<LayerInfo>)> {
+        let manifest_json = std::fs::read_to_string(manifest_path)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to read manifest file: {}", e)))?;
+
+        let oci_manifest: ClientOciImageManifest = serde_json::from_str(&manifest_json)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to parse {}: {}", context, e)))?;
+
+        let config_digest_str = oci_manifest.config.digest.clone();
+
+        let layers: Vec<LayerInfo> = oci_manifest
+            .layers
+            .iter()
+            .map(|layer| LayerInfo {
+                digest: layer.digest.clone(),
+                media_type: layer.media_type.clone(),
+            })
+            .collect();
+
+        Ok((config_digest_str, layers))
+    }
+
+    /// Import OCI image blobs (config and layers) from local directory.
+    async fn import_oci_blobs(
+        &self,
+        image_dir: &std::path::Path,
+        config_digest: &str,
+        layers: &[LayerInfo],
+    ) -> BoxliteResult<()> {
+        let config_blob_path = image_dir
+            .join("blobs")
+            .join(config_digest.replace(':', "/"));
+        self.import_config_to_storage(&config_blob_path, config_digest)
+            .await?;
+
+        for layer in layers {
+            let layer_blob_path = image_dir.join("blobs").join(layer.digest.replace(':', "/"));
+            self.import_blob_to_storage(&layer_blob_path, &layer.digest)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Import a blob into storage from a local path.
+    async fn import_blob_to_storage(
+        &self,
+        src_path: &std::path::Path,
+        digest: &str,
+    ) -> BoxliteResult<()> {
+        if !src_path.exists() {
+            return Err(BoxliteError::Storage(format!(
+                "Blob not found: {}",
+                src_path.display()
+            )));
+        }
+
+        let dest_path = {
+            let inner = self.inner.read().await;
+            inner.storage.layer_tarball_path(digest)
+        };
+
+        if dest_path.exists() {
+            tracing::debug!("Blob already exists: {}", digest);
+            return Ok(());
+        }
+
+        if std::fs::hard_link(src_path, &dest_path).is_err() {
+            tracing::debug!(
+                "Hard link failed for {}, copying to {}",
+                src_path.display(),
+                dest_path.display()
+            );
+            std::fs::copy(src_path, &dest_path).map_err(|e| {
+                BoxliteError::Storage(format!(
+                    "Failed to copy blob from {} to {}: {}",
+                    src_path.display(),
+                    dest_path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        tracing::debug!("Imported blob: {} -> {}", digest, dest_path.display());
+        Ok(())
+    }
+
+    /// Import a config blob into storage from a local path.
+    async fn import_config_to_storage(
+        &self,
+        src_path: &std::path::Path,
+        digest: &str,
+    ) -> BoxliteResult<()> {
+        if !src_path.exists() {
+            return Err(BoxliteError::Storage(format!(
+                "Config blob not found: {}",
+                src_path.display()
+            )));
+        }
+
+        let dest_path = {
+            let inner = self.inner.read().await;
+            inner.storage.config_path(digest)
+        };
+
+        if dest_path.exists() {
+            tracing::debug!("Config blob already exists: {}", digest);
+            return Ok(());
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = dest_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                BoxliteError::Storage(format!(
+                    "Failed to create config directory {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+        }
+
+        if std::fs::hard_link(src_path, &dest_path).is_err() {
+            tracing::debug!(
+                "Hard link failed for config {}, copying to {}",
+                src_path.display(),
+                dest_path.display()
+            );
+            std::fs::copy(src_path, &dest_path).map_err(|e| {
+                BoxliteError::Storage(format!(
+                    "Failed to copy config from {} to {}: {}",
+                    src_path.display(),
+                    dest_path.display(),
+                    e
+                ))
+            })?;
+        }
+
+        tracing::debug!("Imported config: {} -> {}", digest, dest_path.display());
         Ok(())
     }
 }

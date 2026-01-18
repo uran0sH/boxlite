@@ -30,8 +30,46 @@ pub fn extract_layer_tarball_streaming(tarball_path: &Path, dest: &Path) -> Boxl
         ))
     })?;
 
-    let decoder = GzDecoder::new(BufReader::new(file));
-    apply_oci_layer(decoder, dest)
+    // Detect compression format by reading first 2 bytes
+    let mut header = [0u8; 2];
+    {
+        let file_ref = &file;
+        use std::io::Read;
+        file_ref
+            .take(2)
+            .read_exact(&mut header)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to read layer header: {}", e)))?;
+    }
+
+    // Gzip magic number: 0x1f 0x8b
+    let reader: Box<dyn Read> = if header == [0x1f, 0x8b] {
+        // Gzip-compressed
+        debug!("Detected gzip compression for {}", tarball_path.display());
+        let file = fs::File::open(tarball_path).map_err(|e| {
+            BoxliteError::Storage(format!(
+                "Failed to reopen layer tarball {}: {}",
+                tarball_path.display(),
+                e
+            ))
+        })?;
+        Box::new(GzDecoder::new(BufReader::new(file)))
+    } else {
+        // Uncompressed
+        debug!(
+            "Detected uncompressed tarball for {}",
+            tarball_path.display()
+        );
+        let file = fs::File::open(tarball_path).map_err(|e| {
+            BoxliteError::Storage(format!(
+                "Failed to reopen layer tarball {}: {}",
+                tarball_path.display(),
+                e
+            ))
+        })?;
+        Box::new(BufReader::new(file))
+    };
+
+    apply_oci_layer(reader, dest)
 }
 
 /// Apply an OCI layer tar stream into `dest`, handling whiteouts inline.
