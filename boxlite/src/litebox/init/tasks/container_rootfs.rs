@@ -91,54 +91,87 @@ async fn run_container_rootfs(
 
         let disk = Disk::new(disk_path.clone(), DiskFormat::Qcow2, true);
 
-        let image_ref = match rootfs_spec {
-            RootfsSpec::Image(r) => r,
-            RootfsSpec::RootfsPath(_) => {
-                return Err(BoxliteError::Storage(
-                    "Direct rootfs paths not yet supported".into(),
-                ));
+        // Load container config
+        let container_image_config = match rootfs_spec {
+            RootfsSpec::Image(r) => {
+                let image = pull_image(runtime, r).await?;
+                let image_config = image.load_config().await?;
+                let mut config = ContainerImageConfig::from_oci_config(&image_config)?;
+                if !env.is_empty() {
+                    config.merge_env(env.to_vec());
+                }
+                config
+            }
+            RootfsSpec::RootfsPath(path) => {
+                let bundle_dir = std::path::Path::new(path);
+
+                if !bundle_dir.exists() {
+                    return Err(BoxliteError::Storage(format!(
+                        "Rootfs path does not exist: {}",
+                        path
+                    )));
+                }
+
+                let (config, _) = load_oci_image_layout(bundle_dir, runtime).await?;
+                let mut config = config;
+                if !env.is_empty() {
+                    config.merge_env(env.to_vec());
+                }
+                config
             }
         };
-        let image = pull_image(runtime, image_ref).await?;
-        let image_config = image.load_config().await?;
-        let mut container_image_config = ContainerImageConfig::from_oci_config(&image_config)?;
-        if !env.is_empty() {
-            container_image_config.merge_env(env.to_vec());
-        }
 
         return Ok((container_image_config, disk));
     }
 
     // Fresh start: pull image and prepare rootfs
-    let image_ref = match rootfs_spec {
-        RootfsSpec::Image(r) => r,
-        RootfsSpec::RootfsPath(_) => {
-            return Err(BoxliteError::Storage(
-                "Direct rootfs paths not yet supported".into(),
-            ));
+    let (container_image_config, rootfs_result) = match rootfs_spec {
+        RootfsSpec::Image(r) => {
+            let image = pull_image(runtime, r).await?;
+
+            let rootfs_result = if USE_DISK_ROOTFS {
+                prepare_disk_rootfs(runtime, &image).await?
+            } else if USE_OVERLAYFS {
+                prepare_overlayfs_layers(&image).await?
+            } else {
+                return Err(BoxliteError::Storage(
+                    "Merged rootfs not supported. Use overlayfs or disk rootfs.".into(),
+                ));
+            };
+
+            let image_config = image.load_config().await?;
+            let mut config = ContainerImageConfig::from_oci_config(&image_config)?;
+
+            if !env.is_empty() {
+                config.merge_env(env.to_vec());
+            }
+
+            (config, rootfs_result)
+        }
+        RootfsSpec::RootfsPath(path) => {
+            let bundle_dir = std::path::Path::new(path);
+
+            if !bundle_dir.exists() {
+                return Err(BoxliteError::Storage(format!(
+                    "Rootfs path does not exist: {}",
+                    path
+                )));
+            }
+
+            // Load from OCI Image Layout format
+            let (config, rootfs_result) = load_oci_image_layout(bundle_dir, runtime).await?;
+
+            // Merge user-provided environment
+            let mut config = config;
+            if !env.is_empty() {
+                config.merge_env(env.to_vec());
+            }
+
+            (config, rootfs_result)
         }
     };
 
-    let image = pull_image(runtime, image_ref).await?;
-
-    let rootfs_result = if USE_DISK_ROOTFS {
-        prepare_disk_rootfs(runtime, &image).await?
-    } else if USE_OVERLAYFS {
-        prepare_overlayfs_layers(&image).await?
-    } else {
-        return Err(BoxliteError::Storage(
-            "Merged rootfs not supported. Use overlayfs or disk rootfs.".into(),
-        ));
-    };
-
     let disk = create_cow_disk(&rootfs_result, layout, disk_size_gb)?;
-
-    let image_config = image.load_config().await?;
-    let mut container_image_config = ContainerImageConfig::from_oci_config(&image_config)?;
-
-    if !env.is_empty() {
-        container_image_config.merge_env(env.to_vec());
-    }
 
     Ok((container_image_config, disk))
 }
@@ -339,6 +372,190 @@ async fn prepare_disk_rootfs(
 
     Ok(ContainerRootfsPrepResult::DiskImage {
         base_disk_path: final_path,
+        disk_size,
+    })
+}
+
+/// Load rootfs from OCI Image Layout format.
+///
+/// Expected structure:
+///   index.json        - OCI index pointing to manifest digest
+///   blobs/sha256/     - Content-addressed blobs (manifest, config, layers)
+///
+/// This is the standard OCI image layout format, typically produced by:
+/// - `podman save --format=oci-dir`
+/// - `skopeo copy docker://alpine oci:alpine-dir`
+/// - Extracted OCI archives
+async fn load_oci_image_layout(
+    bundle_dir: &std::path::Path,
+    runtime: &SharedRuntimeImpl,
+) -> BoxliteResult<(ContainerImageConfig, ContainerRootfsPrepResult)> {
+    tracing::info!("Loading OCI image layout from: {}", bundle_dir.display());
+
+    // 1. Load index.json (entry point)
+    let index_path = bundle_dir.join("index.json");
+    if !index_path.exists() {
+        return Err(BoxliteError::Storage(format!(
+            "OCI image layout must contain index.json, not found at: {}",
+            index_path.display()
+        )));
+    }
+
+    let index_json = std::fs::read_to_string(&index_path)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to read index.json: {}", e)))?;
+
+    let index: oci_spec::image::ImageIndex = serde_json::from_str(&index_json)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to parse index.json: {}", e)))?;
+
+    // 2. Get manifest from index (use first manifest)
+    let manifest_entry = index
+        .manifests()
+        .first()
+        .ok_or_else(|| BoxliteError::Storage("No manifests in index.json".into()))?;
+
+    let manifest_digest = manifest_entry.digest().digest();
+    tracing::debug!("Loading manifest: {}", manifest_digest);
+
+    // 3. Load manifest from blobs
+    let manifest_path = blob_path(bundle_dir, manifest_digest)?;
+    let manifest_json = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to read manifest: {}", e)))?;
+
+    let manifest: oci_spec::image::ImageManifest = serde_json::from_str(&manifest_json)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to parse manifest: {}", e)))?;
+
+    // 4. Load config from manifest
+    let config_digest = manifest.config().digest().digest();
+    tracing::debug!("Loading config: {}", config_digest);
+
+    let config_path = blob_path(bundle_dir, config_digest)?;
+    let config_json = std::fs::read_to_string(&config_path)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to read config blob: {}", e)))?;
+
+    let oci_config: oci_spec::image::ImageConfiguration = serde_json::from_str(&config_json)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to parse OCI config: {}", e)))?;
+
+    let container_config = ContainerImageConfig::from_oci_config(&oci_config)?;
+
+    // 5. Get layer tarballs from manifest
+    let layer_paths: Vec<std::path::PathBuf> = manifest
+        .layers()
+        .iter()
+        .map(|layer_desc| {
+            let digest = layer_desc.digest().digest();
+            blob_path(bundle_dir, digest)
+        })
+        .collect::<BoxliteResult<Vec<_>>>()?;
+
+    if layer_paths.is_empty() {
+        return Err(BoxliteError::Storage("No layers in manifest".into()));
+    }
+
+    tracing::info!("Found {} layers in OCI image layout", layer_paths.len());
+
+    // 6. Extract and merge layers, create disk
+    let rootfs_result = prepare_disk_from_oci_layers(&layer_paths, runtime).await?;
+
+    Ok((container_config, rootfs_result))
+}
+
+/// Get blob path from digest or hash.
+///
+/// Converts:
+/// - "sha256:abc123..." -> "bundle_dir/blobs/sha256/abc123..."
+/// - "abc123..." (hash only) -> "bundle_dir/blobs/sha256/abc123..."
+fn blob_path(
+    bundle_dir: &std::path::Path,
+    digest_or_hash: &str,
+) -> BoxliteResult<std::path::PathBuf> {
+    // If already has prefix, use it; otherwise assume sha256
+    let (algorithm, hash) = if digest_or_hash.contains(':') {
+        let parts: Vec<&str> = digest_or_hash.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return Err(BoxliteError::Storage(format!(
+                "Invalid digest format: {}",
+                digest_or_hash
+            )));
+        }
+        (parts[0], parts[1])
+    } else {
+        // Assume sha256 if no prefix
+        ("sha256", digest_or_hash)
+    };
+
+    if algorithm != "sha256" {
+        return Err(BoxliteError::Storage(format!(
+            "Unsupported digest algorithm: {} (only sha256 supported)",
+            algorithm
+        )));
+    }
+
+    Ok(bundle_dir.join("blobs").join(algorithm).join(hash))
+}
+
+/// Prepare disk image from OCI layer tarballs.
+///
+/// Extracts and merges layers in order, then creates ext4 disk image.
+async fn prepare_disk_from_oci_layers(
+    layer_tarballs: &[std::path::PathBuf],
+    runtime: &SharedRuntimeImpl,
+) -> BoxliteResult<ContainerRootfsPrepResult> {
+    // Create temporary directory for merged rootfs
+    let temp_base = runtime.layout.temp_dir();
+    let temp_dir = tempfile::tempdir_in(&temp_base)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to create temp directory: {}", e)))?;
+    let merged_path = temp_dir.path().join("merged");
+
+    std::fs::create_dir_all(&merged_path)
+        .map_err(|e| BoxliteError::Storage(format!("Failed to create merged directory: {}", e)))?;
+
+    // Extract layers in order (each layer overwrites previous)
+    for (i, tarball) in layer_tarballs.iter().enumerate() {
+        tracing::debug!(
+            "Extracting layer {}/{}: {}",
+            i + 1,
+            layer_tarballs.len(),
+            tarball.display()
+        );
+
+        crate::images::extract_layer_tarball_streaming(tarball, &merged_path)?;
+    }
+
+    tracing::info!(
+        "Merged {} layers into: {}",
+        layer_tarballs.len(),
+        merged_path.display()
+    );
+
+    // Create ext4 disk image
+    let temp_disk_path = temp_dir.path().join("rootfs.ext4");
+    let merged_clone = merged_path.clone();
+    let disk_path_clone = temp_disk_path.clone();
+
+    let temp_disk =
+        tokio::task::spawn_blocking(move || create_ext4_from_dir(&merged_clone, &disk_path_clone))
+            .await
+            .map_err(|e| BoxliteError::Internal(format!("Disk creation task failed: {}", e)))??;
+
+    let disk_size = std::fs::metadata(&temp_disk_path)
+        .map(|m| m.len())
+        .unwrap_or(64 * 1024 * 1024);
+
+    tracing::info!(
+        "Created ext4 disk image from OCI layers: {} ({}MB)",
+        temp_disk_path.display(),
+        disk_size / (1024 * 1024)
+    );
+
+    // Leak the disk to prevent cleanup (the file will be used as backing for COW disk)
+    let _ = temp_disk.leak();
+
+    // Prevent temp_dir from being cleaned up when the function returns
+    // keep() consumes the TempDir and returns the PathBuf, preventing automatic deletion
+    let _kept_path = temp_dir.keep();
+
+    Ok(ContainerRootfsPrepResult::DiskImage {
+        base_disk_path: temp_disk_path,
         disk_size,
     })
 }
