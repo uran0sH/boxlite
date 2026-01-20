@@ -106,4 +106,36 @@ impl ImageManager {
             Arc::clone(&self.store),
         ))
     }
+
+    /// Load an OCI/Docker image from a local directory.
+    ///
+    /// Reads image manifest from `manifest.json` and returns an `ImageObject`.
+    /// Layers and configs are imported into the image store using hard links.
+    ///
+    /// Expected structure:
+    ///   ```text
+    ///   {path}/
+    ///     manifest.json     - Docker/OCI manifest with Config and Layers paths
+    ///     blobs/sha256/     - Content-addressed blobs
+    ///   ```
+    ///
+    /// # Arguments
+    /// * `path` - Path to local image directory
+    /// * `reference` - Image reference for display (e.g., "local/redis:latest")
+    ///
+    /// # Returns
+    /// `ImageObject` with access to layers and config
+    pub async fn load_from_local(
+        &self,
+        path: std::path::PathBuf,
+        reference: String,
+    ) -> BoxliteResult<ImageObject> {
+        let manifest = self.store.load_from_local(path).await?;
+
+        Ok(ImageObject::new(
+            reference,
+            manifest,
+            Arc::clone(&self.store),
+        ))
+    }
 }

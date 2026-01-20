@@ -196,6 +196,140 @@ impl ImageStore {
         }
     }
 
+    /// Load an OCI/Docker image from a local directory.
+    ///
+    /// Reads image manifest from manifest.json and returns an `ImageManifest`.
+    /// Layers and configs are imported into the image store using hard links.
+    ///
+    /// Expected structure:
+    ///   ```text
+    ///   {path}/
+    ///     manifest.json     - Docker/OCI manifest with Config and Layers paths
+    ///     blobs/sha256/     - Content-addressed blobs
+    ///       {config_digest}
+    ///       {layer_digest_1}
+    ///       {layer_digest_2}
+    ///       ...
+    ///   ```
+    ///
+    /// The manifest.json format:
+    ///   ```json
+    ///   [{
+    ///     "Config": "blobs/sha256/abc123...",
+    ///     "Layers": ["blobs/sha256/def456...", ...]
+    ///   }]
+    ///   ```
+    ///
+    /// # Arguments
+    /// * `path` - Path to local image directory
+    ///
+    /// # Returns
+    /// `ImageManifest` with layer digests and config digest
+    ///
+    /// # Errors
+    /// - If `path/manifest.json` doesn't exist
+    /// - If any referenced blob is missing
+    /// - If hard linking fails
+    pub async fn load_from_local(&self, path: std::path::PathBuf) -> BoxliteResult<ImageManifest> {
+        tracing::info!("Loading image from local path: {}", path.display());
+
+        // 1. Load manifest.json
+        let manifest_path = path.join("manifest.json");
+        if !manifest_path.exists() {
+            return Err(BoxliteError::Storage(format!(
+                "Local image must contain manifest.json, not found at: {}",
+                manifest_path.display()
+            )));
+        }
+
+        let manifest_json = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to read manifest.json: {}", e)))?;
+
+        // Parse manifest format: array of manifest objects
+        let manifests: Vec<serde_json::Value> = serde_json::from_str(&manifest_json)
+            .map_err(|e| BoxliteError::Storage(format!("Failed to parse manifest.json: {}", e)))?;
+
+        let manifest_obj = manifests
+            .first()
+            .ok_or_else(|| BoxliteError::Storage("Empty manifest.json".into()))?;
+
+        // 2. Extract config path and convert to digest
+        let config_path = manifest_obj
+            .get("Config")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BoxliteError::Storage("Manifest missing Config field".into()))?;
+
+        // "blobs/sha256/abc..." -> "sha256:abc..."
+        let config_digest = config_path.replace('/', ":");
+
+        // 3. Extract layer paths and convert to digests
+        let layers_arr = manifest_obj
+            .get("Layers")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| BoxliteError::Storage("Manifest missing Layers field".into()))?;
+
+        let mut layers = Vec::new();
+        for layer_path in layers_arr {
+            let path_str = layer_path
+                .as_str()
+                .ok_or_else(|| BoxliteError::Storage("Layer path is not a string".into()))?;
+            let digest = path_str.replace('/', ":");
+            layers.push(LayerInfo {
+                digest,
+                media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
+            });
+        }
+
+        // 4. Import config and layers into storage (hard link)
+        {
+            let inner = self.inner.write().await;
+
+            // Import config blob (configs stored in configs_dir, not layers_dir)
+            let config_blob_path = path.join(config_path);
+            if !config_blob_path.exists() {
+                return Err(BoxliteError::Storage(format!(
+                    "Config blob not found: {}",
+                    config_blob_path.display()
+                )));
+            }
+            import_config_to_storage(&inner.storage, &config_blob_path, &config_digest)?;
+
+            // Import layer blobs
+            for layer in &layers {
+                let layer_path = layer.digest.replace(':', "/");
+                let layer_blob_path = path.join(&layer_path);
+
+                if !layer_blob_path.exists() {
+                    return Err(BoxliteError::Storage(format!(
+                        "Layer blob not found: {}",
+                        layer_blob_path.display()
+                    )));
+                }
+
+                import_blob_to_storage(&inner.storage, &layer_blob_path, &layer.digest)?;
+            }
+        }
+
+        // Generate manifest digest from content
+        use sha2::Digest;
+        let manifest_digest = format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(manifest_json.as_bytes())
+        );
+
+        tracing::info!(
+            "Loaded local image: config={}, {} layers",
+            config_digest,
+            layers.len()
+        );
+
+        Ok(ImageManifest {
+            manifest_digest,
+            layers,
+            config_digest,
+        })
+    }
+
     /// Load config JSON for an image.
     ///
     /// Returns the raw JSON string. Use `serde_json::from_str()` to parse.
@@ -818,6 +952,95 @@ impl ImageStore {
 
         Ok(())
     }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/// Import a single blob into storage from a local path.
+///
+/// Uses hard links to avoid copying. Falls back to copy if hard link fails.
+fn import_blob_to_storage(
+    storage: &crate::images::storage::ImageStorage,
+    src_path: &std::path::Path,
+    digest: &str,
+) -> BoxliteResult<()> {
+    let dest_path = storage.layer_tarball_path(digest);
+
+    if dest_path.exists() {
+        tracing::debug!("Blob already exists: {}", digest);
+        return Ok(());
+    }
+
+    // Try hard link first (fast, no extra space)
+    if let Err(_) = std::fs::hard_link(src_path, &dest_path) {
+        // Fallback to copy if hard link fails (different filesystems, etc.)
+        tracing::debug!(
+            "Hard link failed for {}, copying to {}",
+            src_path.display(),
+            dest_path.display()
+        );
+        std::fs::copy(src_path, &dest_path).map_err(|e| {
+            BoxliteError::Storage(format!(
+                "Failed to copy blob from {} to {}: {}",
+                src_path.display(),
+                dest_path.display(),
+                e
+            ))
+        })?;
+    }
+
+    tracing::debug!("Imported blob: {} -> {}", digest, dest_path.display());
+    Ok(())
+}
+
+/// Import a config blob into storage from a local path.
+///
+/// Uses hard links to avoid copying. Falls back to copy if hard link fails.
+fn import_config_to_storage(
+    storage: &crate::images::storage::ImageStorage,
+    src_path: &std::path::Path,
+    digest: &str,
+) -> BoxliteResult<()> {
+    let dest_path = storage.config_path(digest);
+
+    if dest_path.exists() {
+        tracing::debug!("Config blob already exists: {}", digest);
+        return Ok(());
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            BoxliteError::Storage(format!(
+                "Failed to create config directory {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+
+    // Try hard link first (fast, no extra space)
+    if let Err(_) = std::fs::hard_link(src_path, &dest_path) {
+        // Fallback to copy if hard link fails (different filesystems, etc.)
+        tracing::debug!(
+            "Hard link failed for config {}, copying to {}",
+            src_path.display(),
+            dest_path.display()
+        );
+        std::fs::copy(src_path, &dest_path).map_err(|e| {
+            BoxliteError::Storage(format!(
+                "Failed to copy config from {} to {}: {}",
+                src_path.display(),
+                dest_path.display(),
+                e
+            ))
+        })?;
+    }
+
+    tracing::debug!("Imported config: {} -> {}", digest, dest_path.display());
+    Ok(())
 }
 
 // ============================================================================
