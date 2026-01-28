@@ -320,6 +320,7 @@ impl ImageStorage {
     /// Load config blob from disk.
     ///
     /// **Mutability**: Immutable - reads file only, no state changes.
+    #[allow(dead_code)]
     pub fn load_config(&self, digest: &str) -> BoxliteResult<String> {
         let config_path = self.config_path(digest);
 
@@ -441,6 +442,18 @@ impl ImageStorage {
         self.layout
             .disk_images_dir()
             .join(format!("{}.{}", filename, format.as_str()))
+    }
+
+    /// Compute cache directory for a local OCI bundle.
+    ///
+    /// Delegates to `ImageFilesystemLayout::local_bundle_cache_dir`.
+    pub fn local_bundle_cache_dir(
+        &self,
+        bundle_path: &std::path::Path,
+        manifest_digest: &str,
+    ) -> PathBuf {
+        self.layout
+            .local_bundle_cache_dir(bundle_path, manifest_digest)
     }
 
     /// Find existing disk image for an image digest, checking all known formats.
