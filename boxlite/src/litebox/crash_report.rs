@@ -114,6 +114,14 @@ impl CrashReport {
                  • Console: {console_display}\n\
                  • Stderr:  {stderr_display}"
             ),
+            ExitInfo::Error { message, .. } => format!(
+                "Box {box_id} failed to start: error\n\n\
+                 The shim process exited with an error.\n\n\
+                 Error: {message}\n\n\
+                 Debug files:\n\
+                 • Console: {console_display}\n\
+                 • Stderr:  {stderr_display}"
+            ),
         };
 
         // Include brief debug info if available (first 5 lines)
@@ -192,6 +200,27 @@ mod tests {
         assert!(report.user_message.contains("panic"));
         assert!(report.user_message.contains("assertion failed"));
         assert!(report.user_message.contains("main.rs:42:5"));
+    }
+
+    #[test]
+    fn test_error_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let exit_file = dir.path().join("exit");
+        let console_log = dir.path().join("console.log");
+        let stderr_file = dir.path().join("stderr");
+
+        std::fs::write(
+            &exit_file,
+            r#"{"type":"error","exit_code":1,"message":"Failed to create VM instance"}"#,
+        )
+        .unwrap();
+
+        let report =
+            CrashReport::from_exit_file(&exit_file, &console_log, &stderr_file, "test-box");
+
+        assert!(report.user_message.contains("error"));
+        assert!(report.user_message.contains("Failed to create VM instance"));
+        assert!(report.debug_info.is_empty());
     }
 
     #[test]

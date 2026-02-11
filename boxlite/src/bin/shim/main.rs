@@ -22,9 +22,9 @@ use std::time::Duration;
 use boxlite::{
     runtime::layout,
     util::{self, is_process_alive},
-    vmm::{self, InstanceSpec, VmmConfig, VmmKind},
+    vmm::{self, ExitInfo, InstanceSpec, VmmConfig, VmmKind},
 };
-use boxlite_shared::errors::BoxliteResult;
+use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 use clap::Parser;
 use crash_capture::CrashCapture;
 #[allow(unused_imports)]
@@ -102,9 +102,8 @@ fn main() -> BoxliteResult<()> {
     let args = ShimArgs::parse();
 
     // Parse InstanceSpec from JSON
-    let mut config: InstanceSpec = serde_json::from_str(&args.config).map_err(|e| {
-        boxlite_shared::errors::BoxliteError::Engine(format!("Failed to parse config JSON: {}", e))
-    })?;
+    let config: InstanceSpec = serde_json::from_str(&args.config)
+        .map_err(|e| BoxliteError::Engine(format!("Failed to parse config JSON: {}", e)))?;
 
     // Initialize logging using home_dir from config
     // Keep guard alive until end of main to ensure logs are written
@@ -121,6 +120,24 @@ fn main() -> BoxliteResult<()> {
         box_id = %config.box_id,
         "Box runner starting"
     );
+
+    // Save exit_file path for error handling
+    let exit_file = config.exit_file.clone();
+
+    // Run the shim and handle errors
+    run_shim(args, config).inspect_err(|e| {
+        let info = ExitInfo::Error {
+            exit_code: 1,
+            message: e.to_string(),
+        };
+
+        if let Ok(json) = serde_json::to_string(&info) {
+            let _ = std::fs::write(&exit_file, json);
+        }
+    })
+}
+
+fn run_shim(args: ShimArgs, mut config: InstanceSpec) -> BoxliteResult<()> {
     tracing::debug!(
         shares = ?config.fs_shares.shares(),
         "Filesystem shares configured"

@@ -20,9 +20,10 @@ use std::path::Path;
 
 /// Exit information written to the exit file as JSON.
 ///
-/// Two variants for different crash types:
+/// Three variants for different exit types:
 /// - `Signal`: Process killed by signal (SIGABRT, SIGSEGV, etc.)
 /// - `Panic`: Rust panic occurred
+/// - `Error`: Normal error returned from instance.enter()
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ExitInfo {
@@ -38,6 +39,8 @@ pub enum ExitInfo {
         message: String,
         location: String,
     },
+    /// Normal error returned from shim (e.g., instance.enter() failed).
+    Error { exit_code: i32, message: String },
 }
 
 impl ExitInfo {
@@ -54,6 +57,7 @@ impl ExitInfo {
         match self {
             ExitInfo::Signal { exit_code, .. } => *exit_code,
             ExitInfo::Panic { exit_code, .. } => *exit_code,
+            ExitInfo::Error { exit_code, .. } => *exit_code,
         }
     }
 
@@ -61,15 +65,23 @@ impl ExitInfo {
     pub fn signal_name(&self) -> Option<&str> {
         match self {
             ExitInfo::Signal { signal, .. } => Some(signal),
-            ExitInfo::Panic { .. } => None,
+            ExitInfo::Panic { .. } | ExitInfo::Error { .. } => None,
         }
     }
 
     /// Get the panic message if this is a panic.
     pub fn panic_message(&self) -> Option<&str> {
         match self {
-            ExitInfo::Signal { .. } => None,
             ExitInfo::Panic { message, .. } => Some(message),
+            ExitInfo::Signal { .. } | ExitInfo::Error { .. } => None,
+        }
+    }
+
+    /// Get the error message if this is an error.
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            ExitInfo::Error { message, .. } => Some(message),
+            ExitInfo::Signal { .. } | ExitInfo::Panic { .. } => None,
         }
     }
 
@@ -77,7 +89,7 @@ impl ExitInfo {
     pub fn stderr(&self) -> Option<&str> {
         match self {
             ExitInfo::Signal { stderr, .. } => Some(stderr),
-            ExitInfo::Panic { .. } => None,
+            ExitInfo::Panic { .. } | ExitInfo::Error { .. } => None,
         }
     }
 
@@ -89,6 +101,11 @@ impl ExitInfo {
     /// Check if this is a panic.
     pub fn is_panic(&self) -> bool {
         matches!(self, ExitInfo::Panic { .. })
+    }
+
+    /// Check if this is an error.
+    pub fn is_error(&self) -> bool {
+        matches!(self, ExitInfo::Error { .. })
     }
 }
 
@@ -165,5 +182,41 @@ mod tests {
         let info = result.unwrap();
         assert_eq!(info.exit_code(), 134);
         assert_eq!(info.signal_name(), Some("SIGABRT"));
+    }
+
+    #[test]
+    fn test_error_serialization() {
+        let info = ExitInfo::Error {
+            exit_code: 1,
+            message: "Failed to create VM instance".to_string(),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains(r#""type":"error""#));
+        assert!(json.contains(r#""exit_code":1"#));
+        assert!(json.contains(r#""message":"Failed to create VM instance""#));
+
+        let parsed: ExitInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.exit_code(), 1);
+        assert_eq!(parsed.error_message(), Some("Failed to create VM instance"));
+        assert!(parsed.is_error());
+    }
+
+    #[test]
+    fn test_error_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exit");
+        std::fs::write(
+            &path,
+            r#"{"type":"error","exit_code":1,"message":"test error"}"#,
+        )
+        .unwrap();
+
+        let result = ExitInfo::from_file(&path);
+        assert!(result.is_some());
+        let info = result.unwrap();
+        assert_eq!(info.exit_code(), 1);
+        assert_eq!(info.error_message(), Some("test error"));
+        assert!(info.is_error());
     }
 }
