@@ -323,6 +323,8 @@ impl From<JsBoxOptions> for BoxOptions {
             auto_remove: js_opts.auto_remove.unwrap_or(false),
             detach: js_opts.detach.unwrap_or(false),
             security,
+            restart_policy: Default::default(),
+            restart_on_reboot: false,
             entrypoint: js_opts.entrypoint,
             cmd: js_opts.cmd,
             user: js_opts.user,

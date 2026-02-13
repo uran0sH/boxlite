@@ -415,6 +415,9 @@ pub struct BoxInfo {
     /// Allocated memory in MiB.
     pub memory_mib: u32,
 
+    /// Restart policy for automatic restart on crash.
+    pub restart_policy: crate::runtime::restart_policy::RestartPolicy,
+
     /// User-defined labels for filtering and organization.
     pub labels: HashMap<String, String>,
 }
@@ -437,6 +440,7 @@ impl BoxInfo {
             },
             cpus: config.options.cpus.unwrap_or(2),
             memory_mib: config.options.memory_mib.unwrap_or(512),
+            restart_policy: config.options.restart_policy,
             labels: HashMap::new(),
         }
     }
@@ -451,6 +455,7 @@ impl PartialEq for BoxInfo {
             && self.image == other.image
             && self.cpus == other.cpus
             && self.memory_mib == other.memory_mib
+            && self.restart_policy == other.restart_policy
             && self.labels == other.labels
     }
 }
@@ -632,6 +637,7 @@ mod tests {
         assert_eq!(info.image, "python:3.11");
         assert_eq!(info.cpus, 4);
         assert_eq!(info.memory_mib, 1024);
+        assert_eq!(info.restart_policy, config.options.restart_policy);
     }
 
     #[test]

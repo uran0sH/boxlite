@@ -2,6 +2,7 @@
 
 use crate::runtime::constants::envs as const_envs;
 use crate::runtime::layout::dirs as const_dirs;
+use crate::runtime::restart_policy::RestartPolicy;
 use boxlite_shared::errors::BoxliteResult;
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
@@ -606,6 +607,25 @@ pub struct BoxOptions {
     #[serde(default)]
     pub security: SecurityOptions,
 
+    /// Restart policy for the box.
+    ///
+    /// Controls whether and how the box is restarted when it crashes.
+    /// Similar to Docker's `--restart` flag.
+    #[serde(default)]
+    pub restart_policy: RestartPolicy,
+
+    /// Whether to restart the box when the system reboots.
+    ///
+    /// When true, the runtime will attempt to restart this box after
+    /// a system reboot if it was running before the reboot.
+    /// This is similar to Docker's `--restart` policy combined with
+    /// system service auto-start.
+    ///
+    /// When false (default), the box will not be automatically restarted
+    /// after system reboot and will remain in Stopped state.
+    #[serde(default)]
+    pub restart_on_reboot: bool,
+
     /// Override the image's ENTRYPOINT directive.
     ///
     /// When set, completely replaces the image's ENTRYPOINT.
@@ -658,6 +678,8 @@ impl Default for BoxOptions {
             auto_remove: default_auto_remove(),
             detach: default_detach(),
             security: SecurityOptions::default(),
+            restart_policy: RestartPolicy::default(),
+            restart_on_reboot: false,
             entrypoint: None,
             cmd: None,
             user: None,

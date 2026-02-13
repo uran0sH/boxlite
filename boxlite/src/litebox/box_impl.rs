@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 
+use super::BoxBuilder;
 use super::config::BoxConfig;
 use super::exec::{BoxCommand, ExecStderr, ExecStdin, ExecStdout, Execution};
 use super::state::BoxState;
@@ -26,6 +27,7 @@ use crate::metrics::{BoxMetrics, BoxMetricsStorage};
 use crate::portal::GuestSession;
 use crate::runtime::rt_impl::SharedRuntimeImpl;
 use crate::runtime::types::BoxStatus;
+use crate::util::read_pid_file;
 use crate::vmm::controller::VmmHandler;
 use crate::{BoxID, BoxInfo};
 
@@ -359,6 +361,12 @@ impl BoxImpl {
 
         tracing::info!("Stopped box {}", self.id());
 
+        // Stop monitoring for this box if restart policy is enabled
+        // This ensures the crash monitoring task is cleaned up when the box is stopped
+        if self.config.options.restart_policy.is_enabled() {
+            self.runtime.stop_monitoring(&self.config.id).await;
+        }
+
         // Increment runtime-wide stopped counter
         self.runtime
             .runtime_metrics
@@ -368,6 +376,87 @@ impl BoxImpl {
         if self.config.options.auto_remove {
             self.runtime.remove_box(self.id(), false)?;
         }
+
+        Ok(())
+    }
+
+    /// Restart the box.
+    ///
+    /// This can be called for crash recovery or manual restart.
+    /// It reuses the existing rootfs (preserving user modifications).
+    ///
+    /// # State Management
+    ///
+    /// The caller is responsible for:
+    /// - Setting the state to `Restarting` before calling this method
+    /// - Updating restart_count after successful restart (for crash recovery)
+    ///
+    /// This method:
+    /// - Calls BoxBuilder with `Restarting` status
+    /// - BoxBuilder treats `Restarting` the same as `Stopped` (reuse rootfs)
+    /// - Transitions DB state from `Restarting` → `Running`
+    ///
+    /// # Errors
+    ///
+    /// Returns error if restart fails. The caller is responsible for
+    /// marking the box as Failed.
+    pub(crate) async fn restart(&self) -> BoxliteResult<()> {
+        tracing::info!(box_id = %self.config.id, "Restarting box");
+
+        // Get current state (should be Restarting, set by caller)
+        let build_state = self.state.read().clone();
+
+        // Retrieve the lock (allocated during initial create())
+        let lock_id = build_state.lock_id.ok_or_else(|| {
+            BoxliteError::Internal(format!(
+                "box {} is missing lock_id (status: {:?})",
+                self.config.id, build_state.status
+            ))
+        })?;
+        let locker = self.runtime.lock_manager.retrieve(lock_id)?;
+
+        // Hold the lock for the duration of build operations
+        let _guard = LockGuard::new(&*locker);
+
+        // Build the box (lock is held)
+        // BoxBuilder treats Restarting the same as Stopped (reuse rootfs, spawn new VM)
+        let builder = BoxBuilder::new(Arc::clone(&self.runtime), self.config.clone(), build_state)?;
+        let (_live_state, mut cleanup_guard) = builder.build().await?;
+
+        // Read PID from file (single source of truth) and update state
+        let pid_file = self
+            .runtime
+            .layout
+            .boxes_dir()
+            .join(self.config.id.as_str())
+            .join("shim.pid");
+
+        let pid = read_pid_file(&pid_file)?;
+
+        // Update state with new PID and Running status
+        {
+            let mut state = self.state.write();
+            state.set_pid(Some(pid));
+            state.set_status(BoxStatus::Running);
+
+            // Save to DB (this transitions from Restarting to Running)
+            self.runtime.box_manager.save_box(&self.config.id, &state)?;
+
+            tracing::debug!(
+                box_id = %self.config.id,
+                pid = pid,
+                "Restart completed, saved new state"
+            );
+        }
+
+        // All operations succeeded - disarm the cleanup guard
+        cleanup_guard.disarm();
+
+        tracing::info!(
+            box_id = %self.config.id,
+            pid = pid,
+            "Box restarted successfully"
+        );
 
         Ok(())
     }
@@ -494,10 +583,6 @@ impl BoxImpl {
     /// Note: Lock is allocated in create(), not here. DB persistence also
     /// happens in create().
     async fn init_live_state(&self) -> BoxliteResult<LiveState> {
-        use super::BoxBuilder;
-        use crate::util::read_pid_file;
-        use std::sync::Arc;
-
         let state = self.state.read().clone();
         let is_first_start = state.status == BoxStatus::Configured;
 
@@ -567,6 +652,12 @@ impl BoxImpl {
             "Box started successfully (first_start={})",
             is_first_start
         );
+
+        if self.config.options.restart_policy.is_enabled() {
+            self.runtime
+                .start_restart_monitoring(self.config.id.clone(), self.config.name.clone())
+                .await?;
+        }
 
         // Lock is automatically released when _guard drops
         Ok(live_state)

@@ -16,9 +16,21 @@ use crate::vmm::VmmKind;
 use boxlite_shared::{BoxliteError, BoxliteResult, Transport};
 use chrono::Utc;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::Duration;
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
+
+/// Monitoring task for automatic restart on crash.
+///
+/// Tracks both the cancellation token (for stopping) and the JoinHandle
+/// (for waiting and cleanup).
+pub(crate) struct MonitoringTask {
+    /// Token for cancelling the monitoring task.
+    pub(crate) cancel_token: CancellationToken,
+    /// Handle for the monitoring task, allowing us to wait for completion.
+    pub(crate) join_handle: tokio::task::JoinHandle<()>,
+}
 
 /// Internal runtime state protected by single lock.
 ///
@@ -75,6 +87,19 @@ pub struct RuntimeImpl {
     /// Use `.is_cancelled()` for sync checks, `.cancelled()` for async select!.
     /// Child tokens are passed to each box via `.child_token()`.
     pub(crate) shutdown_token: CancellationToken,
+
+    /// Monitoring tasks for automatic restart on crash.
+    ///
+    /// Maps box_id -> MonitoringTask for each active monitoring task.
+    /// When a box is removed or manually stopped, its monitoring is cancelled.
+    pub(crate) monitoring_tasks: RwLock<HashMap<BoxID, MonitoringTask>>,
+
+    /// Restart-on-reboot task spawned during initialization.
+    ///
+    /// This task is spawned when the runtime first starts to restart boxes
+    /// that have `restart_on_reboot=true`. We track it to ensure it
+    /// completes before runtime shutdown.
+    pub(crate) reboot_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Synchronized state protected by RwLock.
@@ -202,12 +227,17 @@ impl RuntimeImpl {
             lock_manager,
             _runtime_lock: runtime_lock,
             shutdown_token: CancellationToken::new(),
+            monitoring_tasks: RwLock::new(HashMap::new()),
+            reboot_task: Mutex::new(None),
         });
 
         tracing::debug!("initialized runtime");
 
         // Recover boxes from database
         inner.recover_boxes()?;
+
+        // Handle restart-on-reboot for boxes with restart_on_reboot=true
+        inner.handle_restart_on_reboot_after_recovery()?;
 
         Ok(inner)
     }
@@ -549,6 +579,29 @@ impl RuntimeImpl {
 
         // Cancel the shutdown token - marks shutdown and signals all in-flight operations
         self.shutdown_token.cancel();
+
+        // Wait for reboot task to complete (with timeout)
+        let reboot_task = self.reboot_task.lock().unwrap().take();
+        if let Some(reboot_task) = reboot_task {
+            tracing::info!("Waiting for restart-on-reboot task to complete");
+
+            let reboot_timeout = Duration::from_secs(30); // 30 second timeout for reboot task
+
+            match tokio::time::timeout(reboot_timeout, reboot_task).await {
+                Ok(Ok(())) => {
+                    tracing::debug!("Restart-on-reboot task completed");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Restart-on-reboot task failed"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!("Restart-on-reboot task timed out after 30 seconds");
+                }
+            }
+        }
 
         // Collect all active boxes
         let active_boxes: Vec<SharedBoxImpl> = {
@@ -1157,6 +1210,697 @@ impl RuntimeImpl {
             sync.active_boxes_by_name.remove(name);
         }
         tracing::trace!(box_id = %box_id, name = ?box_name, "Invalidated BoxImpl cache");
+    }
+
+    // ========================================================================
+    // MONITORING AND RESTART
+    // ========================================================================
+
+    /// Start monitoring for a box if restart policy is enabled.
+    ///
+    /// This is called after a box successfully starts (enters Running state).
+    /// It spawns a background task that monitors the box for crashes and
+    /// automatically restarts it according to the restart policy.
+    ///
+    /// The monitoring task is tracked via JoinHandle, allowing proper cleanup
+    /// and shutdown coordination.
+    pub(crate) async fn start_restart_monitoring(
+        self: &Arc<Self>,
+        box_id: BoxID,
+        box_name: Option<String>,
+    ) -> BoxliteResult<()> {
+        // Check if monitoring is already running for this box
+        {
+            let monitoring = self.monitoring_tasks.read().unwrap();
+            if monitoring.contains_key(&box_id) {
+                tracing::debug!(
+                    box_id = %box_id,
+                    "Monitoring already running"
+                );
+                return Ok(());
+            }
+        }
+
+        // Create cancellation token for this monitoring task
+        let cancel_token = CancellationToken::new();
+
+        // Clone values for the spawned task
+        // let rt_impl = Arc::clone(self);
+        let box_id_for_task = box_id.clone();
+        let cancel_token_for_task = cancel_token.clone();
+        let rt = Arc::clone(self);
+
+        // Spawn the monitoring task and track its JoinHandle
+        let join_handle = tokio::spawn(async move {
+            tracing::debug!(
+                box_id = %box_id_for_task,
+                "Started monitoring task"
+            );
+
+            // Pass box_id by reference (monitor_loop now takes &BoxID)
+            rt.monitor_loop(&box_id_for_task, box_name, cancel_token_for_task)
+                .await;
+
+            tracing::debug!(
+                box_id = %box_id_for_task,
+                "Stopped monitoring task"
+            );
+        });
+
+        // Store the MonitoringTask (token + handle) before returning
+        {
+            let mut monitoring = self.monitoring_tasks.write().unwrap();
+            monitoring.insert(
+                box_id,
+                MonitoringTask {
+                    cancel_token,
+                    join_handle,
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Stop monitoring for a box.
+    ///
+    /// Cancels the monitoring task and waits for it to complete (with timeout).
+    /// This is called when a box is manually stopped or removed.
+    pub(crate) async fn stop_monitoring(&self, box_id: &BoxID) {
+        let monitoring_task = {
+            let mut monitoring = self.monitoring_tasks.write().unwrap();
+            monitoring.remove(box_id)
+        };
+
+        if let Some(task) = monitoring_task {
+            // Cancel the monitoring task
+            task.cancel_token.cancel();
+
+            // Wait for the task to finish (with 5 second timeout)
+            let timeout = Duration::from_secs(5);
+            match tokio::time::timeout(timeout, task.join_handle).await {
+                Ok(Ok(())) => {
+                    tracing::debug!(
+                        box_id = %box_id,
+                        "Monitoring task stopped successfully"
+                    );
+                }
+                Ok(Err(e)) => {
+                    // Task panicked or was aborted
+                    tracing::warn!(
+                        box_id = %box_id,
+                        error = %e,
+                        "Monitoring task terminated with error"
+                    );
+                }
+                Err(_) => {
+                    // Timeout - task didn't stop in time
+                    tracing::warn!(
+                        box_id = %box_id,
+                        "Monitoring task did not stop within {:?}, aborting",
+                        timeout
+                    );
+                }
+            }
+        }
+    }
+
+    /// Monitoring loop for a box.
+    ///
+    /// State-driven monitoring based on BoxStatus:
+    /// - Running: Check if process is alive, trigger restart if crashed
+    /// - Stopping: Wait for stop to complete (state will change to Stopped)
+    /// - Stopped: Exit monitoring loop
+    async fn monitor_loop(
+        self: &Arc<Self>,
+        box_id: &BoxID,
+        _box_name: Option<String>,
+        token: CancellationToken,
+    ) {
+        use crate::util::is_process_alive;
+
+        loop {
+            // Use tokio::select! to wait for either:
+            // 1. 5-second polling interval
+            // 2. Cancellation token (box stopped/runtime shutdown)
+            tokio::select! {
+                _ = token.cancelled() => {
+                    tracing::debug!(
+                        box_id = %box_id,
+                        "Monitoring cancelled"
+                    );
+                    break;
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                    // Check if box process is still alive
+                    let (_config, state) = match self.box_manager.lookup_box(box_id.as_str()) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => {
+                            tracing::warn!(
+                                box_id = %box_id,
+                                "Box not found, stopping monitoring"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                box_id = %box_id,
+                                error = %e,
+                                "Failed to lookup box, stopping monitoring"
+                            );
+                            break;
+                        }
+                    };
+
+                    // State-driven behavior
+                    match state.status {
+                        BoxStatus::Running => {
+                            // Check if we have a PID to monitor
+                            let pid = match state.pid {
+                                Some(pid) => pid,
+                                None => {
+                                    tracing::trace!(
+                                        box_id = %box_id,
+                                        "No VMM PID, skipping health check"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Check if process is alive
+                            if !is_process_alive(pid) {
+                                tracing::error!(
+                                    box_id = %box_id,
+                                    pid = pid,
+                                    "Box process died, triggering restart"
+                                );
+
+                                // Mark as Stopped (crash is an exit event)
+                                let mut state = state.clone();
+                                state.transition_to(BoxStatus::Stopped).unwrap();
+                                state.last_exit_code = None; // Process died without exit code
+                                self.box_manager.save_box(box_id, &state).unwrap();
+
+                                // Handle crash and restart
+                                // This will evaluate restart policy and attempt restart if needed
+                                if let Err(e) = self.handle_crash_and_restart(box_id).await {
+                                    tracing::error!(
+                                        box_id = %box_id,
+                                        error = %e,
+                                        "Restart failed, exiting monitoring loop"
+                                    );
+                                    break;
+                                }
+
+                                // Restart succeeded, continue monitoring (state is now Running)
+                                tracing::debug!(
+                                    box_id = %box_id,
+                                    "Restart completed, resuming monitoring"
+                                );
+                            }
+                        }
+                        BoxStatus::Stopping => {
+                            // Box is stopping, wait for state to change to Stopped
+                            tracing::trace!(
+                                box_id = %box_id,
+                                "Box is stopping, waiting for state change"
+                            );
+                            continue;
+                        }
+                        BoxStatus::Stopped => {
+                            // Terminal state, exit monitoring
+                            tracing::info!(
+                                box_id = %box_id,
+                                status = ?state.status,
+                                "Box in terminal state, exiting monitoring loop"
+                            );
+                            break;
+                        }
+                        BoxStatus::Configured => {
+                            // Box not started yet, exit monitoring
+                            tracing::info!(
+                                box_id = %box_id,
+                                "Box not started, exiting monitoring loop"
+                            );
+                            break;
+                        }
+                        BoxStatus::Unknown => {
+                            tracing::warn!(
+                                box_id = %box_id,
+                                "Box in Unknown state, exiting monitoring loop"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle crash and restart for a box.
+    ///
+    /// This method implements the restart policy decision engine:
+    /// 1. Load configuration and state
+    /// 2. Check if max attempts exceeded
+    /// 3. Check if restart is needed based on policy
+    /// 4. Calculate backoff delay using calculate_backoff(state.restart_count)
+    /// 5. Wait for backoff delay
+    /// 6. Execute restart via BoxBuilder (with Stopped status)
+    /// 7. Update state (increment restart count, transition to Running)
+    ///
+    /// # Design Note: Restart as Runtime-Only Operation
+    ///
+    /// `BoxBuilder` only supports: `Configured`, `Stopped`, `Running`.
+    /// It doesn't understand `Restarting` because restart is just "start a stopped box".
+    ///
+    /// To maintain two-layer model:
+    /// - DB state stays `Stopped` throughout restart operation
+    /// - Restart is an in-memory runtime operation (not persisted)
+    /// - After build completes, DB state transitions to `Running` (set by init_live_state)
+    ///
+    /// External queries see: `Stopped` → `Running` (with backoff delay in between)
+    /// Internal flow: `Stopped` → [backoff] → `Running`
+    ///
+    /// # Why This Method Lives in RuntimeImpl
+    ///
+    /// While calling `BoxBuilder` directly violates strict layering, this is intentional:
+    ///
+    /// - `BoxImpl.start()` is for user-initiated starts (via LiteBox handle)
+    /// - Restart is an internal operation triggered by crash monitoring
+    /// - Moving restart logic to `BoxImpl` would require passing all policy
+    ///   state (backoff, max attempts, restart count) as parameters
+    ///
+    /// # Monitoring
+    ///
+    /// This does NOT stop/start monitoring. The `monitor_loop` will automatically:
+    /// - Resume monitoring when state changes to `Running`
+    ///
+    /// # Arguments
+    ///
+    /// * `box_id` - Box ID that crashed
+    async fn handle_crash_and_restart(self: &Arc<Self>, box_id: &BoxID) -> BoxliteResult<()> {
+        use crate::runtime::restart_policy::calculate_backoff;
+
+        // 1. Load configuration and state
+        let (config, mut state) = self
+            .box_manager
+            .lookup_box(box_id.as_str())?
+            .ok_or_else(|| BoxliteError::NotFound(box_id.to_string()))?;
+
+        let policy = &config.options.restart_policy;
+
+        tracing::info!(
+            box_id = %box_id,
+            policy = %policy,
+            restart_count = state.restart_count,
+            "Handling crash"
+        );
+
+        // 2. Check if max attempts exceeded
+        if policy.has_exceeded_max_attempts(state.restart_count) {
+            // Mark as permanently failed (still Stopped, but with failure_reason)
+            state.failure_reason = Some(format!(
+                "Exceeded max restart attempts (policy: {}, count: {})",
+                policy, state.restart_count
+            ));
+            state.mark_stop(); // Keep status as Stopped
+            self.box_manager.save_box(box_id, &state)?;
+            tracing::error!(
+                box_id = %box_id,
+                "Max restart attempts exceeded, marked as permanently failed"
+            );
+            return Ok(());
+        }
+
+        // 3. Check if restart is needed
+        let should_restart = policy.should_restart(state.last_exit_code, state.manually_stopped);
+
+        if !should_restart {
+            state.mark_stop();
+            state.manually_stopped = false; // Reset manual stop flag
+            self.box_manager.save_box(box_id, &state)?;
+            tracing::info!(
+                box_id = %box_id,
+                "Restart policy says no restart"
+            );
+            return Ok(());
+        }
+
+        // 4. Calculate backoff delay
+        let backoff = calculate_backoff(state.restart_count);
+
+        tracing::info!(
+            box_id = %box_id,
+            restart_count = state.restart_count,
+            backoff_secs = backoff.as_secs(),
+            "Waiting for backoff before restart"
+        );
+
+        // 5. Wait for backoff delay
+        tokio::time::sleep(backoff).await;
+
+        // 6. Restart the box (runtime-only operation, not persisted)
+        tracing::info!(box_id = %box_id, "Restarting box");
+
+        // 7. Get BoxImpl from cache and call restart
+        let box_impl = self.get_box_impl_for_restart(box_id)?;
+
+        box_impl.restart().await.map_err(|e: BoxliteError| {
+            tracing::error!(
+                box_id = %box_id,
+                error = %e,
+                "Restart failed"
+            );
+
+            // Restart failed, mark as permanently failed
+            let mut state = state.clone();
+            state.failure_reason = Some(format!("Restart failed: {}", e));
+            state.mark_stop(); // Keep status as Stopped
+            self.box_manager.save_box(box_id, &state).unwrap();
+
+            e
+        })?;
+
+        // 8. Update state after successful restart
+        let (_config_reloaded, mut updated_state) =
+            self.box_manager
+                .lookup_box(box_id.as_str())?
+                .ok_or_else(|| BoxliteError::NotFound(box_id.to_string()))?;
+
+        updated_state.increment_restart_count();
+        updated_state.failure_reason = None; // Clear failure reason on successful restart
+        updated_state.last_exit_code = Some(0); // Successful start, exit code 0
+        self.box_manager.save_box(box_id, &updated_state)?;
+
+        tracing::info!(
+            box_id = %box_id,
+            new_count = updated_state.restart_count,
+            "Box restarted successfully"
+        );
+
+        Ok(())
+    }
+
+    /// Get BoxImpl from cache for restart operations.
+    ///
+    /// This is called by `handle_crash_and_restart` to get the BoxImpl instance
+    /// for calling `restart_for_crash()`.
+    ///
+    /// # Returns
+    ///
+    /// Returns the cached BoxImpl if found, otherwise creates a new one.
+    /// The BoxImpl is always expected to exist in cache for active boxes.
+    fn get_box_impl_for_restart(self: &Arc<Self>, box_id: &BoxID) -> BoxliteResult<SharedBoxImpl> {
+        let sync = self.sync_state.read().unwrap();
+
+        // Try to get from cache by ID
+        if let Some(weak) = sync.active_boxes_by_id.get(box_id) {
+            if let Some(strong) = weak.upgrade() {
+                return Ok(strong);
+            }
+        }
+
+        // Not in cache - this shouldn't happen for active boxes
+        // but we can recover by reloading from DB and creating a new BoxImpl
+        tracing::warn!(
+            box_id = %box_id,
+            "BoxImpl not in cache, reloading from DB"
+        );
+
+        let (config, state) = self
+            .box_manager
+            .lookup_box(box_id.as_str())?
+            .ok_or_else(|| BoxliteError::NotFound(box_id.to_string()))?;
+
+        let (box_impl, _) = self.get_or_create_box_impl(config, state);
+        Ok(box_impl)
+    }
+
+    /// Find boxes that need restart-on-reboot and trigger restart.
+    ///
+    /// This is called synchronously from runtime initialization after `recover_boxes()`.
+    /// It finds boxes with Stopped status + restart_on_reboot=true + restart_policy enabled.
+    ///
+    /// # Design
+    ///
+    /// Per the restart design document, restart-on-reboot follows this flow:
+    ///
+    /// ```text
+    /// Stopped + restart_on_reboot=true → Calculate backoff → Attempt restart
+    ///                                                         ↓
+    ///                                            Success → Mark as Running
+    ///                                            Failure → Save failure_reason
+    /// ```
+    ///
+    /// # Implementation Notes
+    ///
+    /// - Uses tokio::spawn to avoid blocking runtime initialization
+    /// - Staggers restarts with 1-second delay per box to avoid resource spikes
+    /// - Reuses existing `start_box_for_reboot` method for actual restart logic
+    /// - Logs success/failure for each box independently
+    fn handle_restart_on_reboot_after_recovery(self: &Arc<Self>) -> BoxliteResult<()> {
+        use crate::runtime::types::BoxStatus;
+
+        // Get all boxes with restart_on_reboot=true
+        let all_boxes = self.box_manager.all_boxes(true)?;
+
+        // Collect boxes that need restart-on-reboot
+        // Conditions: Stopped status + restart_on_reboot=true + restart_policy enabled
+        let boxes_to_restart: Vec<(BoxID, Option<String>)> = all_boxes
+            .into_iter()
+            .filter_map(|(config, state)| {
+                if config.options.restart_on_reboot
+                    && state.status == BoxStatus::Stopped
+                    && config.options.restart_policy.is_enabled()
+                {
+                    Some((config.id.clone(), config.name.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if boxes_to_restart.is_empty() {
+            tracing::debug!("No boxes require restart-on-reboot");
+            return Ok(());
+        }
+
+        let count = boxes_to_restart.len();
+        tracing::info!(
+            count = count,
+            "Found {} boxes with restart_on_reboot=true, scheduling restart",
+            count
+        );
+
+        let boxes_to_restart_for_task = boxes_to_restart.clone();
+
+        // Clone Arc for use in async task
+        let runtime = self.clone();
+
+        // Spawn async task to handle restarts (don't block runtime initialization)
+        let reboot_task = tokio::spawn(async move {
+            tracing::info!(
+                count = count,
+                "Starting restart-on-reboot for {} boxes",
+                count
+            );
+
+            // Stagger restarts to avoid starting all boxes at once
+            // This prevents resource spikes (CPU, memory, disk I/O)
+            let mut successes = 0;
+            let mut failures = 0;
+
+            for (index, (box_id, box_name)) in boxes_to_restart_for_task.into_iter().enumerate() {
+                // Add staggered delay (1 second per box)
+                if index > 0 {
+                    let delay = tokio::time::Duration::from_secs(1);
+                    tokio::time::sleep(delay).await;
+                }
+
+                let name_display = box_name.as_deref().unwrap_or("<unnamed>");
+
+                match runtime.start_box_for_reboot(&box_id).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            box_id = %box_id,
+                            box_name = %name_display,
+                            "Restart-on-reboot succeeded"
+                        );
+                        successes += 1;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            box_id = %box_id,
+                            box_name = %name_display,
+                            error = %e,
+                            "Restart-on-reboot failed"
+                        );
+                        failures += 1;
+                    }
+                }
+            }
+
+            tracing::info!(
+                successes = successes,
+                failures = failures,
+                "Restart-on-reboot complete: {} succeeded, {} failed",
+                successes,
+                failures
+            );
+        });
+
+        // Track reboot task for shutdown coordination
+        *self.reboot_task.lock().unwrap() = Some(reboot_task);
+
+        tracing::debug!(
+            count = count,
+            "Spawned restart-on-reboot task and registered for shutdown coordination"
+        );
+
+        Ok(())
+    }
+
+    /// Start a box for restart-on-reboot.
+    ///
+    /// This is similar to crash recovery but triggered by system reboot
+    /// instead of process crash. Key differences:
+    ///
+    /// - No crash detection (box was Stopped, not Crashed)
+    /// - Staggered delay is handled by caller (not here)
+    /// - Preserves existing restart_count (doesn't reset)
+    ///
+    /// # Arguments
+    ///
+    /// * `rt_impl` - Runtime implementation reference
+    /// * `box_id` - Box ID to restart
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) if restart succeeded, Err if restart failed
+    async fn start_box_for_reboot(self: &Arc<Self>, box_id: &BoxID) -> BoxliteResult<()> {
+        use crate::runtime::restart_policy::calculate_backoff;
+
+        // 1. Load configuration and state
+        let (config, state) = self
+            .box_manager
+            .lookup_box(box_id.as_str())?
+            .ok_or_else(|| BoxliteError::NotFound(box_id.to_string()))?;
+
+        let policy = &config.options.restart_policy;
+
+        tracing::info!(
+            box_id = %box_id,
+            policy = %policy,
+            restart_count = state.restart_count,
+            "Starting box for restart-on-reboot"
+        );
+
+        // 2. Check if max attempts exceeded (from previous crashes)
+        if policy.has_exceeded_max_attempts(state.restart_count) {
+            tracing::warn!(
+                box_id = %box_id,
+                restart_count = state.restart_count,
+                max_attempts = ?policy.max_attempts(),
+                "Box exceeded max restart attempts, skipping restart-on-reboot"
+            );
+            return Err(BoxliteError::InvalidState(format!(
+                "Box {} exceeded max restart attempts ({}), \
+                 manual intervention required",
+                box_id, state.restart_count
+            )));
+        }
+
+        // 3. Check if restart is needed based on policy
+        // For restart-on-reboot, we treat it as if the box "crashed"
+        // (last_exit_code = None indicates unknown/crash)
+        let should_restart = policy.should_restart(None, false);
+
+        if !should_restart {
+            tracing::info!(
+                box_id = %box_id,
+                policy = %policy,
+                "Restart policy says no restart, skipping restart-on-reboot"
+            );
+            return Err(BoxliteError::InvalidState(format!(
+                "Restart policy {} prevents auto-restart for box {}",
+                policy, box_id
+            )));
+        }
+
+        // 4. Calculate backoff delay (based on existing restart_count)
+        let backoff = calculate_backoff(state.restart_count);
+
+        tracing::info!(
+            box_id = %box_id,
+            restart_count = state.restart_count,
+            backoff_secs = backoff.as_secs(),
+            "Waiting for backoff before restart-on-reboot"
+        );
+
+        // 5. Wait for backoff delay (cancellable via shutdown token)
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {
+                // Backoff completed, proceed with restart
+                tracing::debug!(
+                    box_id = %box_id,
+                    "Backoff completed, proceeding with restart-on-reboot"
+                );
+            }
+            _ = self.shutdown_token.cancelled() => {
+                // Runtime shutdown requested, abort restart
+                tracing::info!(
+                    box_id = %box_id,
+                    "Restart-on-reboot cancelled during backoff due to runtime shutdown"
+                );
+                return Err(BoxliteError::Stopped(
+                    "Runtime shutdown during restart-on-reboot".into()
+                ));
+            }
+        }
+
+        // 6. Restart the box (runtime-only operation, not persisted)
+        let state = state.clone();
+        tracing::info!(box_id = %box_id, "Restarting box for reboot");
+
+        // 7. Get BoxImpl and call restart
+        let box_impl = self.get_box_impl_for_restart(box_id)?;
+
+        box_impl.restart().await.map_err(|e: BoxliteError| {
+            tracing::error!(
+                box_id = %box_id,
+                error = %e,
+                "Restart-on-reboot failed"
+            );
+
+            // Restart failed, mark as permanently failed
+            let mut state = state.clone();
+            state.failure_reason = Some(format!("Restart-on-reboot failed: {}", e));
+            state.mark_stop(); // Keep status as Stopped
+            let _ = self.box_manager.save_box(box_id, &state);
+
+            e
+        })?;
+
+        // 8. Update state after successful restart
+        // Note: restart already set status to Running and saved to DB,
+        // we just need to update restart-related fields
+        let (_config_reloaded, mut updated_state) =
+            self.box_manager
+                .lookup_box(box_id.as_str())?
+                .ok_or_else(|| BoxliteError::NotFound(box_id.to_string()))?;
+
+        updated_state.increment_restart_count();
+        updated_state.failure_reason = None; // Clear failure reason on successful restart
+        updated_state.last_exit_code = Some(0); // Successful start, exit code 0
+        self.box_manager.save_box(box_id, &updated_state)?;
+
+        tracing::info!(
+            box_id = %box_id,
+            new_count = updated_state.restart_count,
+            "Box restarted successfully on reboot"
+        );
+
+        Ok(())
     }
 
     /// Acquire coordination lock for multi-step atomic operations.

@@ -13,12 +13,24 @@ use serde::{Deserialize, Serialize};
 /// Represents the current operational state of a VM box.
 /// Transitions between states are validated by the state machine.
 ///
-/// State machine (Docker/Podman-style):
+/// State machine (two-layer model with runtime restart logic):
 /// ```text
 /// create() → Configured (persisted to DB, no VM)
 /// start()  → Running (VM initialized)
-/// stop()   → Stopped (VM terminated, can restart)
+/// stop()   → Stopping → Stopped (VM terminated, can restart)
+///
+/// With restart policy (runtime layer):
+/// crash()  → Stopped (persisted)
+///           → [runtime: evaluate policy]
+///           → [runtime: backoff delay]
+///           → Running (if restart allowed)
+///           → Stopped (if restart denied or max exceeded)
 /// ```
+///
+/// Exit reason is determined by BoxState fields:
+/// - `last_exit_code == Some(0)`: normal exit
+/// - `last_exit_code != Some(0)`: error exit
+/// - `last_exit_code == None`: crashed (no exit code)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BoxStatus {
@@ -37,6 +49,11 @@ pub enum BoxStatus {
 
     /// Box is not running. VM process terminated.
     /// Rootfs is preserved, box can be restarted.
+    ///
+    /// Exit reason is determined by `last_exit_code`:
+    /// - `Some(0)`: Normal exit
+    /// - `Some(!0)`: Error exit
+    /// - `None`: Crashed (process died without exit code)
     Stopped,
 }
 
@@ -59,9 +76,25 @@ impl BoxStatus {
     }
 
     /// Check if this status represents a transient state.
-    /// Only Stopping is transient - Configured is a stable state.
+    /// Only Stopping is a transient state.
     pub fn is_transient(&self) -> bool {
         matches!(self, BoxStatus::Stopping)
+    }
+
+    /// Check if this status requires monitoring (only active boxes).
+    pub fn requires_monitoring(&self) -> bool {
+        matches!(self, BoxStatus::Running)
+    }
+
+    /// Check if this status is a terminal failure state.
+    /// No terminal failure states - all can be recovered.
+    pub fn is_terminal_failure(&self) -> bool {
+        false
+    }
+
+    /// Check if restart is allowed from this state.
+    pub fn can_restart(&self) -> bool {
+        matches!(self, BoxStatus::Stopped)
     }
 
     /// Check if start() can be called from this state.
@@ -105,14 +138,14 @@ impl BoxStatus {
             (Configured, Running) |
             (Configured, Stopped) |
             (Configured, Unknown) |
-            // Running → Stopping (graceful) or Stopped (crash)
+            // Running → Stopping (graceful) or Stopped (crash/exit)
             (Running, Stopping) |
             (Running, Stopped) |
             (Running, Unknown) |
             // Stopping → Stopped (complete) or Unknown (error)
             (Stopping, Stopped) |
             (Stopping, Unknown) |
-            // Stopped → Running (restart directly, no intermediate state)
+            // Stopped → Running (restart directly)
             (Stopped, Running) |
             (Stopped, Unknown)
         )
@@ -142,6 +175,8 @@ impl std::str::FromStr for BoxStatus {
             "running" => Ok(BoxStatus::Running),
             "stopping" => Ok(BoxStatus::Stopping),
             "stopped" => Ok(BoxStatus::Stopped),
+            // Legacy: support old states for backward compatibility
+            "crashed" | "restarting" | "failed" => Ok(BoxStatus::Stopped),
             _ => Err(()),
         }
     }
@@ -170,6 +205,37 @@ pub struct BoxState {
     /// Allocated when the box is first initialized (not at creation time).
     /// Used to retrieve the lock across process restarts.
     pub lock_id: Option<LockId>,
+    /// Number of times the box has been restarted.
+    ///
+    /// Incremented each time the box crashes and is restarted
+    /// according to the restart policy. Reset to 0 when the box
+    /// is explicitly stopped and started again.
+    #[serde(default)]
+    pub restart_count: u32,
+    /// Timestamp of the last restart attempt (UTC).
+    ///
+    /// Set each time the box is restarted. Used for calculating
+    /// exponential backoff delays between restart attempts.
+    #[serde(default)]
+    pub last_restarted_at: Option<DateTime<Utc>>,
+    /// Reason for the last failure, if any.
+    ///
+    /// Set when the box fails after exceeding max restart attempts.
+    /// Used for diagnostics and user feedback.
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    /// Last process exit code.
+    ///
+    /// Used by restart policy to determine if restart is needed.
+    /// OnFailure policy: restart only if exit_code != 0
+    #[serde(default)]
+    pub last_exit_code: Option<i32>,
+    /// Whether the box was manually stopped.
+    ///
+    /// Used by UnlessStopped restart policy to prevent restart
+    /// after manual stop. Reset to false on crash/restart.
+    #[serde(default)]
+    pub manually_stopped: bool,
 }
 
 impl BoxState {
@@ -182,6 +248,11 @@ impl BoxState {
             container_id: None,
             last_updated: Utc::now(),
             lock_id: None,
+            restart_count: 0,
+            last_restarted_at: None,
+            failure_reason: None,
+            last_exit_code: None,
+            manually_stopped: false,
         }
     }
 
@@ -224,21 +295,64 @@ impl BoxState {
         self.last_updated = Utc::now();
     }
 
-    /// Mark box as crashed (sets status to Stopped since VM is no longer running).
+    /// Mark box as stopped (VM process terminated).
     ///
-    /// In our simplified state model, crashed VMs become Stopped
-    /// since the rootfs is preserved and can be restarted.
+    /// Called when the box stops (either gracefully or due to crash).
     /// PID is cleared since the process is no longer alive.
+    /// Exit reason should be set via `last_exit_code` field.
     pub fn mark_stop(&mut self) {
         self.status = BoxStatus::Stopped;
         self.pid = None;
         self.last_updated = Utc::now();
     }
 
+    /// Increment restart counter and update timestamp.
+    ///
+    /// Called each time a box is restarted according to its restart policy.
+    pub fn increment_restart_count(&mut self) {
+        self.restart_count += 1;
+        self.last_restarted_at = Some(Utc::now());
+        self.last_updated = Utc::now();
+    }
+
+    /// Reset restart counter.
+    ///
+    /// Called when a box is explicitly stopped and started again,
+    /// clearing the restart history.
+    pub fn reset_restart_count(&mut self) {
+        self.restart_count = 0;
+        self.last_restarted_at = None;
+        self.last_updated = Utc::now();
+    }
+
+    /// Check if the box stopped cleanly (exit code 0).
+    pub fn stopped_cleanly(&self) -> bool {
+        self.status == BoxStatus::Stopped && self.last_exit_code == Some(0)
+    }
+
+    /// Check if the box stopped with error (non-zero exit code).
+    pub fn stopped_with_error(&self) -> bool {
+        self.status == BoxStatus::Stopped && self.last_exit_code.unwrap_or(0) != 0
+    }
+
+    /// Check if the box crashed (no exit code).
+    pub fn crashed(&self) -> bool {
+        self.status == BoxStatus::Stopped && self.last_exit_code.is_none()
+    }
+
+    /// Check if the box has exceeded max restart attempts.
+    ///
+    /// This is determined by comparing `restart_count` with the policy's max attempts.
+    /// A box in this state cannot be auto-restarted without manual intervention.
+    pub fn is_permanently_failed(&self) -> bool {
+        self.status == BoxStatus::Stopped && self.restart_count > 0 && self.failure_reason.is_some()
+    }
+
     /// Reset state after system reboot.
     ///
     /// Active boxes become Stopped since VM rootfs is preserved.
     /// PID is cleared since all processes are gone after reboot.
+    /// Restart count and failure state are preserved.
     pub fn reset_for_reboot(&mut self) {
         if self.status.is_active() {
             self.status = BoxStatus::Stopped;
@@ -278,6 +392,36 @@ mod tests {
     }
 
     #[test]
+    fn test_status_requires_monitoring() {
+        // Only Running requires monitoring
+        assert!(!BoxStatus::Configured.requires_monitoring());
+        assert!(BoxStatus::Running.requires_monitoring());
+        assert!(!BoxStatus::Stopping.requires_monitoring());
+        assert!(!BoxStatus::Stopped.requires_monitoring());
+        assert!(!BoxStatus::Unknown.requires_monitoring());
+    }
+
+    #[test]
+    fn test_status_is_terminal_failure() {
+        // No terminal failure states
+        assert!(!BoxStatus::Configured.is_terminal_failure());
+        assert!(!BoxStatus::Running.is_terminal_failure());
+        assert!(!BoxStatus::Stopping.is_terminal_failure());
+        assert!(!BoxStatus::Stopped.is_terminal_failure());
+        assert!(!BoxStatus::Unknown.is_terminal_failure());
+    }
+
+    #[test]
+    fn test_status_can_restart() {
+        // Only Stopped can restart
+        assert!(!BoxStatus::Configured.can_restart());
+        assert!(!BoxStatus::Running.can_restart());
+        assert!(!BoxStatus::Stopping.can_restart());
+        assert!(BoxStatus::Stopped.can_restart());
+        assert!(!BoxStatus::Unknown.can_restart());
+    }
+
+    #[test]
     fn test_status_can_start() {
         // Configured and Stopped can be started
         assert!(BoxStatus::Configured.can_start());
@@ -299,12 +443,22 @@ mod tests {
 
     #[test]
     fn test_status_can_exec() {
-        // Configured and Stopped trigger implicit start
+        // Configured, Running, and Stopped can exec
         assert!(BoxStatus::Configured.can_exec());
         assert!(BoxStatus::Running.can_exec());
         assert!(!BoxStatus::Stopping.can_exec());
         assert!(BoxStatus::Stopped.can_exec());
         assert!(!BoxStatus::Unknown.can_exec());
+    }
+
+    #[test]
+    fn test_status_can_remove() {
+        // Configured, Stopped, and Unknown can be removed
+        assert!(BoxStatus::Configured.can_remove());
+        assert!(!BoxStatus::Running.can_remove());
+        assert!(!BoxStatus::Stopping.can_remove());
+        assert!(BoxStatus::Stopped.can_remove());
+        assert!(BoxStatus::Unknown.can_remove());
     }
 
     #[test]
@@ -405,6 +559,61 @@ mod tests {
     }
 
     #[test]
+    fn test_restart_count_increment() {
+        let mut state = BoxState::new();
+        assert_eq!(state.restart_count, 0);
+        assert!(state.last_restarted_at.is_none());
+
+        // Increment restart count
+        state.increment_restart_count();
+
+        assert_eq!(state.restart_count, 1);
+        assert!(state.last_restarted_at.is_some());
+    }
+
+    #[test]
+    fn test_restart_count_multiple_increments() {
+        let mut state = BoxState::new();
+
+        for i in 1..=5 {
+            state.increment_restart_count();
+            assert_eq!(state.restart_count, i);
+        }
+
+        assert_eq!(state.restart_count, 5);
+    }
+
+    #[test]
+    fn test_restart_count_reset() {
+        let mut state = BoxState::new();
+        state.increment_restart_count();
+        state.increment_restart_count();
+        assert_eq!(state.restart_count, 2);
+
+        state.reset_restart_count();
+
+        assert_eq!(state.restart_count, 0);
+        assert!(state.last_restarted_at.is_none());
+    }
+
+    #[test]
+    fn test_reset_for_reboot_preserves_restart_state() {
+        let mut state = BoxState::new();
+        state.status = BoxStatus::Running;
+        state.pid = Some(12345);
+        state.increment_restart_count();
+        state.increment_restart_count();
+        assert_eq!(state.restart_count, 2);
+
+        state.reset_for_reboot();
+
+        // Restart count and failure state should be preserved
+        assert_eq!(state.status, BoxStatus::Stopped);
+        assert_eq!(state.restart_count, 2);
+        assert!(state.last_restarted_at.is_some());
+    }
+
+    #[test]
     fn test_status_as_str() {
         assert_eq!(BoxStatus::Unknown.as_str(), "unknown");
         assert_eq!(BoxStatus::Configured.as_str(), "configured");
@@ -422,6 +631,62 @@ mod tests {
         assert_eq!("running".parse(), Ok(BoxStatus::Running));
         assert_eq!("stopping".parse(), Ok(BoxStatus::Stopping));
         assert_eq!("stopped".parse(), Ok(BoxStatus::Stopped));
+        // Legacy: old states map to Stopped
+        assert_eq!("crashed".parse(), Ok(BoxStatus::Stopped));
+        assert_eq!("restarting".parse(), Ok(BoxStatus::Stopped));
+        assert_eq!("failed".parse(), Ok(BoxStatus::Stopped));
         assert!("invalid".parse::<BoxStatus>().is_err());
+    }
+
+    #[test]
+    fn test_stopped_cleanly() {
+        let mut state = BoxState::new();
+        state.status = BoxStatus::Stopped;
+        state.last_exit_code = Some(0);
+
+        assert!(state.stopped_cleanly());
+        assert!(!state.stopped_with_error());
+        assert!(!state.crashed());
+    }
+
+    #[test]
+    fn test_stopped_with_error() {
+        let mut state = BoxState::new();
+        state.status = BoxStatus::Stopped;
+        state.last_exit_code = Some(1);
+
+        assert!(!state.stopped_cleanly());
+        assert!(state.stopped_with_error());
+        assert!(!state.crashed());
+    }
+
+    #[test]
+    fn test_crashed() {
+        let mut state = BoxState::new();
+        state.status = BoxStatus::Stopped;
+        state.last_exit_code = None;
+
+        assert!(!state.stopped_cleanly());
+        assert!(!state.stopped_with_error());
+        assert!(state.crashed());
+    }
+
+    #[test]
+    fn test_is_permanently_failed() {
+        let mut state = BoxState::new();
+        state.status = BoxStatus::Stopped;
+        state.restart_count = 5;
+        state.failure_reason = Some("Exceeded max restart attempts".to_string());
+
+        assert!(state.is_permanently_failed());
+
+        // Not permanently failed if no failure reason
+        state.failure_reason = None;
+        assert!(!state.is_permanently_failed());
+
+        // Not permanently failed if restart_count is 0
+        state.restart_count = 0;
+        state.failure_reason = Some("Test".to_string());
+        assert!(!state.is_permanently_failed());
     }
 }
