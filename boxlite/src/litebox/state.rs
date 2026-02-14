@@ -170,6 +170,39 @@ pub struct BoxState {
     /// Allocated when the box is first initialized (not at creation time).
     /// Used to retrieve the lock across process restarts.
     pub lock_id: Option<LockId>,
+    /// Health status (None = health check not configured).
+    pub health_status: Option<HealthStatus>,
+}
+
+/// Health status of a box with health check enabled.
+///
+/// Tracks the current health state and consecutive failure count.
+/// Similar to Docker's health check status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthStatus {
+    /// Current health state.
+    pub state: HealthState,
+    /// Consecutive health check failures.
+    pub failures: u32,
+    /// Last health check timestamp.
+    pub last_check: DateTime<Utc>,
+}
+
+/// Health state of a box.
+///
+/// Docker-compatible health states:
+/// - None: No health check configured
+/// - Starting: Within start_period, not yet checked
+/// - Healthy: Last health check passed
+/// - Unhealthy: Failed `retries` consecutive checks
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HealthState {
+    /// Within start_period, not yet checked.
+    Starting,
+    /// Last health check passed.
+    Healthy,
+    /// Failed retries consecutive checks.
+    Unhealthy,
 }
 
 impl BoxState {
@@ -182,6 +215,7 @@ impl BoxState {
             container_id: None,
             last_updated: Utc::now(),
             lock_id: None,
+            health_status: None,
         }
     }
 
@@ -244,6 +278,48 @@ impl BoxState {
             self.status = BoxStatus::Stopped;
         }
         self.pid = None;
+        self.last_updated = Utc::now();
+    }
+
+    /// Initialize health status (called when box starts with health check configured).
+    pub fn init_health_status(&mut self) {
+        self.health_status = Some(HealthStatus {
+            state: HealthState::Starting,
+            failures: 0,
+            last_check: Utc::now(),
+        });
+        self.last_updated = Utc::now();
+    }
+
+    /// Update health status after a successful check.
+    pub fn mark_health_check_success(&mut self) {
+        if let Some(ref mut health) = self.health_status {
+            health.state = HealthState::Healthy;
+            health.failures = 0;
+            health.last_check = Utc::now();
+            self.last_updated = Utc::now();
+        }
+    }
+
+    /// Update health status after a failed check.
+    /// Returns true if the box should be marked unhealthy.
+    pub fn mark_health_check_failure(&mut self, retries: u32) -> bool {
+        if let Some(ref mut health) = self.health_status {
+            health.failures += 1;
+            health.last_check = Utc::now();
+
+            if health.failures >= retries {
+                health.state = HealthState::Unhealthy;
+                self.last_updated = Utc::now();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Clear health status (called when box stops).
+    pub fn clear_health_status(&mut self) {
+        self.health_status = None;
         self.last_updated = Utc::now();
     }
 }

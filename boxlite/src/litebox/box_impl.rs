@@ -10,6 +10,8 @@ use std::sync::atomic::Ordering;
 use parking_lot::RwLock;
 use tar;
 use tokio::sync::OnceCell;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
@@ -24,10 +26,11 @@ use crate::litebox::copy::CopyOptions;
 use crate::lock::LockGuard;
 use crate::metrics::{BoxMetrics, BoxMetricsStorage};
 use crate::portal::GuestSession;
+use crate::portal::interfaces::GuestInterface;
 use crate::runtime::rt_impl::SharedRuntimeImpl;
 use crate::runtime::types::BoxStatus;
 use crate::vmm::controller::VmmHandler;
-use crate::{BoxID, BoxInfo};
+use crate::{BoxID, BoxInfo, HealthCheckConfig};
 
 // ============================================================================
 // TYPE ALIASES
@@ -95,7 +98,7 @@ impl LiveState {
 pub(crate) struct BoxImpl {
     // --- Always available ---
     pub(crate) config: BoxConfig,
-    pub(crate) state: RwLock<BoxState>,
+    pub(crate) state: Arc<RwLock<BoxState>>,
     pub(crate) runtime: SharedRuntimeImpl,
     /// Cancellation token for this box (child of runtime's token).
     /// When cancelled (via stop() or runtime shutdown), all operations abort gracefully.
@@ -103,6 +106,8 @@ pub(crate) struct BoxImpl {
 
     // --- Lazily initialized ---
     live: OnceCell<LiveState>,
+
+    health_check_task: RwLock<Option<JoinHandle<()>>>,
 }
 
 impl BoxImpl {
@@ -127,10 +132,11 @@ impl BoxImpl {
     ) -> Self {
         Self {
             config,
-            state: RwLock::new(state),
+            state: Arc::new(RwLock::new(state)),
             runtime,
             shutdown_token,
             live: OnceCell::new(),
+            health_check_task: RwLock::new(None),
         }
     }
 
@@ -554,6 +560,11 @@ impl BoxImpl {
             state.set_pid(Some(pid));
             state.set_status(BoxStatus::Running);
 
+            // Initialize health status if health check is configured
+            if self.config.options.health_check.is_some() {
+                state.init_health_status();
+            }
+
             // Save to DB (cache for queries and recovery)
             self.runtime.box_manager.save_box(&self.config.id, &state)?;
 
@@ -567,14 +578,179 @@ impl BoxImpl {
         // All operations succeeded - disarm the cleanup guard
         cleanup_guard.disarm();
 
+        // Start health check task if configured
+        if let Some(ref health_config) = self.config.options.health_check {
+            // Get guest interface from session
+            let guest = live_state.guest_session.guest().await.map_err(|e| {
+                BoxliteError::Internal(format!(
+                    "Failed to get guest interface for health check: {}",
+                    e
+                ))
+            })?;
+
+            // Spawn health check task
+            let health_task = Self::spawn_health_check(
+                Arc::clone(&self.state),
+                self.config.id.to_string(),
+                health_config.clone(),
+                guest,
+                self.shutdown_token.child_token(),
+            );
+            *self.health_check_task.write() = Some(health_task);
+        }
+
         tracing::info!(
             box_id = %self.config.id,
             "Box started successfully (first_start={})",
             is_first_start
         );
-
         // Lock is automatically released when _guard drops
         Ok(live_state)
+    }
+
+    pub fn spawn_health_check(
+        state: Arc<RwLock<BoxState>>,
+        box_id: String,
+        health_config: HealthCheckConfig,
+        mut guest: GuestInterface,
+        shutdown_token: CancellationToken,
+    ) -> JoinHandle<()> {
+        let interval = health_config.interval;
+        let check_timeout = health_config.timeout;
+        let retries = health_config.retries;
+        let start_period = health_config.start_period;
+
+        // Spawn background health check task
+        let join_handle = tokio::spawn(async move {
+            let start_time = Instant::now();
+
+            tracing::info!(
+                box_id = %box_id,
+                interval_secs = interval.as_secs(),
+                timeout_secs = check_timeout.as_secs(),
+                retries,
+                start_period_secs = start_period.as_secs(),
+                "Health check task started"
+            );
+
+            loop {
+                // Check for shutdown
+                if shutdown_token.is_cancelled() {
+                    tracing::debug!(
+                        box_id = %box_id,
+                        "Health check task received shutdown signal"
+                    );
+                    break;
+                }
+
+                // Wait for interval or shutdown
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {},
+                    _ = shutdown_token.cancelled() => {
+                        tracing::debug!(
+                            box_id = %box_id,
+                            "Health check task received shutdown signal during sleep"
+                        );
+                        break;
+                    }
+                }
+
+                // Perform health check
+                let elapsed = start_time.elapsed();
+                let in_start_period = elapsed < start_period;
+
+                // Skip health check during start period
+                let result = if in_start_period {
+                    tracing::debug!(
+                        box_id = %box_id,
+                        elapsed_ms = elapsed.as_millis(),
+                        start_period_ms = start_period.as_millis(),
+                        "In start period, skipping health check"
+                    );
+
+                    Ok(())
+                } else {
+                    // Ping the guest with timeout
+                    let ping_result = timeout(check_timeout, guest.ping()).await;
+
+                    match ping_result {
+                        Ok(Ok(_)) => {
+                            tracing::debug!(
+                                box_id = %box_id,
+                                "Health check passed"
+                            );
+
+                            // Update health status
+                            let mut state_guard = state.write();
+                            state_guard.mark_health_check_success();
+
+                            Ok(())
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                box_id = %box_id,
+                                error = %e,
+                                "Health check ping failed"
+                            );
+
+                            // Update health status
+                            let mut state_guard = state.write();
+                            state_guard.mark_health_check_failure(retries);
+
+                            Err(e)
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                box_id = %box_id,
+                                "Health check timed out after {}s",
+                                check_timeout.as_secs()
+                            );
+
+                            // Update health status
+                            let mut state_guard = state.write();
+                            state_guard.mark_health_check_failure(retries);
+
+                            Err(BoxliteError::Internal("Health check timed out".to_string()))
+                        }
+                    }
+                };
+
+                // If health check failed, check if shim process is still alive
+                if let Err(e) = result {
+                    tracing::warn!(
+                        box_id = %box_id,
+                        error = %e,
+                        "Health check failed"
+                    );
+
+                    // Check if shim process is still alive
+                    if let Some(pid) = state.read().pid {
+                        if !crate::util::is_process_alive(pid) {
+                            tracing::error!(
+                                box_id = %box_id,
+                                pid,
+                                "Shim process died, marking box as Stopped"
+                            );
+
+                            // Mark box as Stopped
+                            let mut state_guard = state.write();
+                            state_guard.force_status(crate::litebox::BoxStatus::Stopped);
+                            state_guard.set_pid(None);
+                            state_guard.clear_health_status();
+
+                            break;
+                        }
+                    }
+                }
+            }
+
+            tracing::debug!(
+                box_id = %box_id,
+                "Health check task stopped"
+            );
+        });
+
+        join_handle
     }
 }
 

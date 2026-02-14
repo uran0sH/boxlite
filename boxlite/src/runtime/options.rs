@@ -6,6 +6,7 @@ use boxlite_shared::errors::BoxliteResult;
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::runtime::advanced_options::{AdvancedBoxOptions, SecurityOptions};
 
@@ -137,6 +138,14 @@ pub struct BoxOptions {
     /// If None, uses the image's USER directive (defaults to root).
     #[serde(default)]
     pub user: Option<String>,
+
+    /// Health check configuration.
+    ///
+    /// When set, a background task will periodically ping the guest agent
+    /// to verify the box is healthy. Unhealthy boxes are marked and can
+    /// trigger automatic recovery.
+    #[serde(default)]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 fn default_auto_remove() -> bool {
@@ -165,6 +174,7 @@ impl Default for BoxOptions {
             entrypoint: None,
             cmd: None,
             user: None,
+            health_check: None,
         }
     }
 }
@@ -257,6 +267,67 @@ pub struct PortSpec {
     #[serde(default = "default_protocol")]
     pub protocol: PortProtocol,
     pub host_ip: Option<String>, // Optional bind IP, defaults to 0.0.0.0/:: if None
+}
+
+/// Health check configuration for boxes.
+///
+/// Defines how to periodically check if a box's guest agent is responsive.
+/// Similar to Docker's HEALTHCHECK directive.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HealthCheckConfig {
+    /// Time between health checks.
+    ///
+    /// Default: 30 seconds
+    #[serde(default = "default_health_interval")]
+    pub interval: Duration,
+
+    /// Time to wait before considering the check failed.
+    ///
+    /// Default: 10 seconds
+    #[serde(default = "default_health_timeout")]
+    pub timeout: Duration,
+
+    /// Number of consecutive failures before marking as unhealthy.
+    ///
+    /// Default: 3
+    #[serde(default = "default_health_retries")]
+    pub retries: u32,
+
+    /// Startup period before health checks count toward failures.
+    ///
+    /// During this period, failures don't count toward the retry limit.
+    /// This gives the box time to boot up before being marked unhealthy.
+    ///
+    /// Default: 60 seconds
+    #[serde(default = "default_health_start_period")]
+    pub start_period: Duration,
+}
+
+fn default_health_interval() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_health_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_health_retries() -> u32 {
+    3
+}
+
+fn default_health_start_period() -> Duration {
+    Duration::from_secs(60)
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval: default_health_interval(),
+            timeout: default_health_timeout(),
+            retries: default_health_retries(),
+            start_period: default_health_start_period(),
+        }
+    }
 }
 
 #[cfg(test)]

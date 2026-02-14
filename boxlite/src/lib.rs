@@ -35,11 +35,12 @@ pub use runtime::{BoxliteRuntime, ImageHandle};
 pub use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 pub use litebox::{
     BoxCommand, CopyOptions, ExecResult, ExecStderr, ExecStdin, ExecStdout, Execution, ExecutionId,
+    HealthState, HealthStatus,
 };
 pub use metrics::{BoxMetrics, RuntimeMetrics};
 pub use runtime::advanced_options::{AdvancedBoxOptions, ResourceLimits, SecurityOptions};
 use runtime::layout::FilesystemLayout;
-pub use runtime::options::{BoxOptions, BoxliteOptions, RootfsSpec};
+pub use runtime::options::{BoxOptions, BoxliteOptions, HealthCheckConfig, RootfsSpec};
 /// Boxlite library version (from CARGO_PKG_VERSION at compile time).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use runtime::types::ContainerID;

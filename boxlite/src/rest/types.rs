@@ -166,6 +166,7 @@ impl BoxResponse {
             cpus: self.cpus,
             memory_mib: self.memory_mib,
             labels: self.labels.clone(),
+            health_status: None, // REST API doesn't provide health status
         }
     }
 }
