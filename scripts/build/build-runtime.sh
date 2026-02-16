@@ -288,6 +288,22 @@ assemble_runtime() {
         echo "✓"
     fi
 
+    # Copy libraries to target/debug or target/release for test compatibility
+    # This is needed because cargo test uses the shim in target/debug,
+    # which has RUNPATH=$ORIGIN and expects libraries in the same directory
+    if [ -n "$PROFILE" ]; then
+        local target_dir="$PROJECT_ROOT/target/$PROFILE"
+        print_step "Copying libraries to $target_dir for test compatibility... "
+
+        # Copy each library if it exists
+        for lib in "$DEST_DIR"/libkrun* "$DEST_DIR"/libgvproxy* "$DEST_DIR"/libkrunfw*; do
+            if [ -f "$lib" ]; then
+                cp -P "$lib" "$target_dir/" 2>/dev/null || true
+            fi
+        done
+        echo "✓"
+    fi
+
     print_success "Runtime directory assembled"
 }
 
