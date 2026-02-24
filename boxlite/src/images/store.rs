@@ -145,13 +145,38 @@ impl ImageStore {
     /// Thread-safe: Multiple concurrent pulls of the same image will only
     /// download once; others will get the cached result.
     pub async fn pull(&self, image_ref: &str) -> BoxliteResult<ImageManifest> {
-        use super::ReferenceIter;
+        use super::{ReferenceIter, is_fully_qualified};
 
         tracing::debug!(
             image_ref = %image_ref,
             registries = ?self.registries,
             "Starting image pull with registry fallback"
         );
+
+        // Ultra-fast path: Check cache before expensive ReferenceIter::new() (364ms cold start)
+        //
+        // Two cases:
+        // 1. Long reference (e.g., "docker.m.daocloud.io/library/alpine:latest"): Direct cache lookup
+        // 2. Short reference (e.g., "alpine:latest"): Check resolution mapping first
+        if is_fully_qualified(image_ref) {
+            let inner = self.inner.read().await;
+            if let Some(manifest) = self.try_load_cached(&inner, image_ref)? {
+                return Ok(manifest);
+            }
+        } else {
+            let resolved_ref = {
+                let inner = self.inner.read().await;
+                inner.index.get_resolution(image_ref)?
+            };
+
+            if let Some(resolved) = resolved_ref {
+                // Use the resolved long reference to check cache
+                let inner = self.inner.read().await;
+                if let Some(manifest) = self.try_load_cached(&inner, &resolved)? {
+                    return Ok(manifest);
+                }
+            }
+        }
 
         // Parse image reference and create iterator over registry candidates
         let candidates = ReferenceIter::new(image_ref, &self.registries)
@@ -173,7 +198,7 @@ impl ImageStore {
 
             // Slow path: pull from registry
             tracing::info!("Pulling image from registry: {}", ref_str);
-            match self.pull_from_registry(&reference).await {
+            match self.pull_from_registry(&reference, image_ref).await {
                 Ok(manifest) => {
                     if !errors.is_empty() {
                         tracing::info!(
@@ -499,7 +524,15 @@ impl ImageStore {
     ///
     /// This method handles the actual network I/O - manifest pull, layer download, etc.
     /// Lock is released during network I/O to allow other operations.
-    async fn pull_from_registry(&self, reference: &Reference) -> BoxliteResult<ImageManifest> {
+    ///
+    /// # Arguments
+    /// * `reference` - The parsed Reference object (full registry path)
+    /// * `original_ref` - The original image reference string provided by user (e.g., "alpine:latest")
+    async fn pull_from_registry(
+        &self,
+        reference: &Reference,
+        original_ref: &str,
+    ) -> BoxliteResult<ImageManifest> {
         // Step 1: Pull manifest (no lock needed - uses self.client)
         let (manifest, manifest_digest_str) = self
             .client
@@ -528,15 +561,25 @@ impl ImageStore {
         self.download_config(reference, &image_manifest.config_digest)
             .await?;
 
-        // Step 6: Update index using reference.whole() as the cache key
-        self.update_index(&reference.whole(), &image_manifest)
+        // Step 6: Update index and resolution mapping
+        self.update_index(original_ref, &reference.whole(), &image_manifest)
             .await?;
 
         Ok(image_manifest)
     }
 
     /// Update index with newly pulled image.
-    async fn update_index(&self, image_ref: &str, manifest: &ImageManifest) -> BoxliteResult<()> {
+    ///
+    /// # Arguments
+    /// * `original_ref` - Original user input (e.g., "alpine:latest")
+    /// * `resolved_ref` - Resolved full reference (e.g., "docker.m.daocloud.io/library/alpine:latest")
+    /// * `manifest` - Image manifest to cache
+    async fn update_index(
+        &self,
+        original_ref: &str,
+        resolved_ref: &str,
+        manifest: &ImageManifest,
+    ) -> BoxliteResult<()> {
         let inner = self.inner.read().await;
 
         let cached_image = CachedImage {
@@ -547,9 +590,20 @@ impl ImageStore {
             complete: true,
         };
 
-        inner.index.upsert(image_ref, &cached_image)?;
+        // Update image index with resolved reference
+        inner.index.upsert(resolved_ref, &cached_image)?;
 
-        tracing::debug!("Updated index for image: {}", image_ref);
+        // Update resolution mapping if original_ref is different from resolved_ref
+        if original_ref != resolved_ref {
+            inner.index.upsert_resolution(original_ref, resolved_ref)?;
+            tracing::debug!(
+                "Updated resolution mapping: {} → {}",
+                original_ref,
+                resolved_ref
+            );
+        }
+
+        tracing::debug!("Updated index for image: {}", resolved_ref);
         Ok(())
     }
 

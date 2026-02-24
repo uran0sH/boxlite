@@ -117,6 +117,41 @@ impl ImageIndexStore {
         Ok(rows_affected > 0)
     }
 
+    /// Get resolved reference for a short reference.
+    ///
+    /// Returns None if no resolution exists.
+    pub fn get_resolution(&self, short_ref: &str) -> BoxliteResult<Option<String>> {
+        let conn = self.db.conn();
+
+        let row: Option<String> = db_err!(
+            conn.query_row(
+                "SELECT resolved_ref FROM reference_resolution WHERE short_ref = ?1",
+                params![short_ref],
+                |row| row.get(0),
+            )
+            .optional()
+        )?;
+
+        Ok(row)
+    }
+
+    /// Update or insert resolution mapping.
+    pub fn upsert_resolution(&self, short_ref: &str, resolved_ref: &str) -> BoxliteResult<()> {
+        let conn = self.db.conn();
+
+        db_err!(conn.execute(
+            r#"
+            INSERT INTO reference_resolution (short_ref, resolved_ref)
+            VALUES (?1, ?2)
+            ON CONFLICT(short_ref) DO UPDATE SET
+                resolved_ref = excluded.resolved_ref
+            "#,
+            params![short_ref, resolved_ref],
+        ))?;
+
+        Ok(())
+    }
+
     /// Get number of cached images in index.
     pub fn len(&self) -> BoxliteResult<usize> {
         let conn = self.db.conn();
@@ -136,8 +171,8 @@ impl ImageIndexStore {
         let conn = self.db.conn();
         let mut stmt = db_err!(conn.prepare(
             r#"
-            SELECT reference, manifest_digest, config_digest, layers, cached_at, complete 
-            FROM image_index 
+            SELECT reference, manifest_digest, config_digest, layers, cached_at, complete
+            FROM image_index
             ORDER BY cached_at DESC
             "#
         ))?;

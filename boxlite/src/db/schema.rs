@@ -7,7 +7,7 @@
 //! Each table has queryable columns for efficient filtering + JSON blob for full data.
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// Schema version tracking table.
 pub const SCHEMA_VERSION_TABLE: &str = r#"
@@ -80,6 +80,18 @@ CREATE TABLE IF NOT EXISTS image_index (
 CREATE INDEX IF NOT EXISTS idx_image_index_manifest_digest ON image_index(manifest_digest);
 "#;
 
+/// Reference resolution mapping table schema.
+///
+/// Maps short references (e.g., "alpine:latest") to their resolved full references
+/// (e.g., "docker.m.daocloud.io/library/alpine:latest"). Enables fast cache lookup
+/// without expensive ReferenceIter::new() parsing.
+pub const REFERENCE_RESOLUTION_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS reference_resolution (
+    short_ref TEXT PRIMARY KEY NOT NULL,
+    resolved_ref TEXT NOT NULL
+);
+"#;
+
 /// Box snapshot table schema (added in v6, replaces v5 `snapshots`).
 ///
 /// Stores snapshot metadata for box state persistence.
@@ -108,6 +120,7 @@ pub fn all_schemas() -> Vec<&'static str> {
         BOX_STATE_TABLE,
         ALIVE_TABLE,
         IMAGE_INDEX_TABLE,
+        REFERENCE_RESOLUTION_TABLE,
         BOX_SNAPSHOT_TABLE,
     ]
 }
