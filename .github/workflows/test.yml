@@ -259,7 +259,7 @@ jobs:
           toolchain: ${{ needs.config.outputs.rust-toolchain }}
 
       - name: Install build dependencies
-        run: make setup:build
+        run: make setup-build
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9

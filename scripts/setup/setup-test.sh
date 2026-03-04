@@ -1,7 +1,7 @@
 #!/bin/bash
 # Setup script for BoxLite test/dev-only tooling.
 #
-# Intended to be run *after* build deps are installed (e.g. after `make setup:build`).
+# Intended to be run *after* build deps are installed (e.g. after `make setup-build`).
 # Idempotent.
 
 set -e

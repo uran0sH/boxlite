@@ -1,12 +1,12 @@
-PHONY_TARGETS += setup setup\:build setup\:test setup\:dev
+PHONY_TARGETS += setup setup-build setup-test setup-dev
 
 # Local-dev default: same as before (build + test/dev extras)
-setup: setup\:dev
+setup: setup-dev
 
-setup\:dev: setup\:build setup\:test
+setup-dev: setup-build setup-test
 
 # Build-only setup (preferred for CI)
-setup\:build:
+setup-build:
 	@if [ "$$(uname)" = "Darwin" ]; then \
 		BOXLITE_SETUP_MODE=build bash $(SCRIPT_DIR)/setup/setup-macos.sh; \
 	elif [ "$$(uname)" = "Linux" ]; then \
@@ -31,6 +31,6 @@ setup\:build:
 	fi
 
 # Test/dev extras setup
-setup\:test:
+setup-test:
 	@bash $(SCRIPT_DIR)/setup/setup-test.sh
 	@$(MAKE) _ensure-python-deps
