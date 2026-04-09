@@ -28,7 +28,8 @@ pub use info::{JsBoxInfo, JsBoxStateInfo, JsHealthState, JsHealthStatus};
 pub use metrics::{JsBoxMetrics, JsRuntimeMetrics};
 pub use options::{
     JsBoxOptions, JsBoxliteRestOptions, JsEnvVar, JsHealthCheckOptions, JsImageRegistry,
-    JsImageRegistryAuth, JsNetworkSpec, JsOptions, JsPortSpec, JsSecret, JsVolumeSpec,
+    JsImageRegistryAuth, JsNetworkSpec, JsOptions, JsPortSpec, JsRestartPolicy, JsSecret,
+    JsVolumeSpec,
 };
 pub use runtime::JsBoxlite; // re-export for dist bundling
 pub use snapshot_options::{JsCloneOptions, JsExportOptions, JsSnapshotOptions};
