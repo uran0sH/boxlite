@@ -1,7 +1,7 @@
 use crate::db::{BoxStore, Database};
 use crate::images::{ImageDiskManager, ImageManager};
 use crate::litebox::config::BoxConfig;
-use crate::litebox::{BoxManager, LiteBox, LocalSnapshotBackend, SharedBoxImpl};
+use crate::litebox::{BoxHandle, BoxManager, LiteBox, SharedBoxHandle, SharedBoxImpl};
 use crate::lock::{FileLockManager, LockManager};
 use crate::metrics::{RuntimeMetrics, RuntimeMetricsStorage};
 use crate::rootfs::guest::{GuestRootfs, GuestRootfsManager};
@@ -20,10 +20,9 @@ use std::sync::{Arc, RwLock, Weak};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-fn litebox_from_impl(box_impl: SharedBoxImpl) -> LiteBox {
-    let box_backend: Arc<dyn crate::runtime::backend::BoxBackend> = box_impl.clone();
-    let snapshot_backend: Arc<dyn crate::runtime::backend::SnapshotBackend> =
-        Arc::new(LocalSnapshotBackend::new(box_impl));
+fn litebox_from_handle(handle: SharedBoxHandle) -> LiteBox {
+    let box_backend: Arc<dyn crate::runtime::backend::BoxBackend> = handle.clone();
+    let snapshot_backend: Arc<dyn crate::runtime::backend::SnapshotBackend> = handle;
     LiteBox::new(box_backend, snapshot_backend)
 }
 
@@ -151,11 +150,11 @@ pub struct RuntimeImpl {
 /// Acquire this when you need atomicity across multiple operations on
 /// box_manager or image_manager.
 pub struct SynchronizedState {
-    /// Cache of active BoxImpl instances by ID.
+    /// Cache of active BoxHandle instances by ID.
     /// Uses Weak to allow automatic cleanup when all handles are dropped.
-    active_boxes_by_id: HashMap<BoxID, Weak<crate::litebox::box_impl::BoxImpl>>,
-    /// Cache of active BoxImpl instances by name (only for named boxes).
-    active_boxes_by_name: HashMap<String, Weak<crate::litebox::box_impl::BoxImpl>>,
+    active_handles_by_id: HashMap<BoxID, Weak<BoxHandle>>,
+    /// Cache of active BoxHandle instances by name (only for named boxes).
+    active_handles_by_name: HashMap<String, Weak<BoxHandle>>,
 }
 
 impl RuntimeImpl {
@@ -264,8 +263,8 @@ impl RuntimeImpl {
 
         let inner = Arc::new(Self {
             sync_state: RwLock::new(SynchronizedState {
-                active_boxes_by_id: HashMap::new(),
-                active_boxes_by_name: HashMap::new(),
+                active_handles_by_id: HashMap::new(),
+                active_handles_by_name: HashMap::new(),
             }),
             box_manager: BoxManager::new(box_store),
             image_manager,
@@ -356,15 +355,15 @@ impl RuntimeImpl {
         if let Some(ref name) = name
             && let Some((config, state)) = self.box_manager.lookup_box(name)?
         {
-            return if reuse_existing {
-                let (box_impl, _) = self.get_or_create_box_impl(config, state);
-                Ok((litebox_from_impl(box_impl), false))
+            if reuse_existing {
+                let (handle, _) = self.get_or_create_box_handle(config, state);
+                return Ok((litebox_from_handle(handle), false));
             } else {
-                Err(BoxliteError::InvalidArgument(format!(
+                return Err(BoxliteError::InvalidArgument(format!(
                     "box with name '{}' already exists",
                     name
-                )))
-            };
+                )));
+            }
         }
 
         // Initialize box variables with defaults
@@ -397,8 +396,8 @@ impl RuntimeImpl {
                 && let Some(ref name) = name
                 && let Some((config, state)) = self.box_manager.lookup_box(name)?
             {
-                let (box_impl, _) = self.get_or_create_box_impl(config, state);
-                return Ok((litebox_from_impl(box_impl), false));
+                let (handle, _) = self.get_or_create_box_handle(config, state);
+                return Ok((litebox_from_handle(handle), false));
             }
 
             return Err(e);
@@ -412,7 +411,7 @@ impl RuntimeImpl {
 
         // Create LiteBox handle with shared BoxImpl
         // This also checks in-memory cache for duplicate names
-        let (box_impl, inserted) = self.get_or_create_box_impl(config, state);
+        let (handle, inserted) = self.get_or_create_box_handle(config, state);
         if !inserted {
             return Err(BoxliteError::InvalidArgument(
                 "box with this name already exists".into(),
@@ -424,7 +423,7 @@ impl RuntimeImpl {
             .boxes_created
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        Ok((litebox_from_impl(box_impl), true))
+        Ok((litebox_from_handle(handle), true))
     }
 
     /// Get a handle to an existing box by ID or name.
@@ -443,19 +442,19 @@ impl RuntimeImpl {
 
             // Try as BoxID first
             if let Some(box_id) = BoxID::parse(id_or_name)
-                && let Some(weak) = sync.active_boxes_by_id.get(&box_id)
+                && let Some(weak) = sync.active_handles_by_id.get(&box_id)
                 && let Some(strong) = weak.upgrade()
             {
                 tracing::trace!(box_id = %box_id, "Found box in cache by ID");
-                return Ok(Some(litebox_from_impl(strong)));
+                return Ok(Some(litebox_from_handle(strong)));
             }
 
             // Try as name
-            if let Some(weak) = sync.active_boxes_by_name.get(id_or_name)
+            if let Some(weak) = sync.active_handles_by_name.get(id_or_name)
                 && let Some(strong) = weak.upgrade()
             {
                 tracing::trace!(name = %id_or_name, "Found box in cache by name");
-                return Ok(Some(litebox_from_impl(strong)));
+                return Ok(Some(litebox_from_handle(strong)));
             }
         }
 
@@ -474,9 +473,9 @@ impl RuntimeImpl {
                 "Retrieved box from DB, getting or creating BoxImpl"
             );
 
-            let (box_impl, _) = self.get_or_create_box_impl(config, state);
+            let (handle, _) = self.get_or_create_box_handle(config, state);
             tracing::trace!(id_or_name = %id_or_name, "LiteBox created successfully");
-            return Ok(Some(litebox_from_impl(box_impl)));
+            return Ok(Some(litebox_from_handle(handle)));
         }
 
         tracing::trace!(id_or_name = %id_or_name, "Box not found");
@@ -503,14 +502,14 @@ impl RuntimeImpl {
 
             // Try as BoxID first
             if let Some(box_id) = BoxID::parse(id_or_name)
-                && let Some(weak) = sync.active_boxes_by_id.get(&box_id)
+                && let Some(weak) = sync.active_handles_by_id.get(&box_id)
                 && let Some(strong) = weak.upgrade()
             {
                 return Ok(Some(strong.info()));
             }
 
             // Try as name
-            if let Some(weak) = sync.active_boxes_by_name.get(id_or_name)
+            if let Some(weak) = sync.active_handles_by_name.get(id_or_name)
                 && let Some(strong) = weak.upgrade()
             {
                 return Ok(Some(strong.info()));
@@ -553,7 +552,7 @@ impl RuntimeImpl {
         // Add in-memory boxes not yet persisted
         {
             let sync = self.sync_state.read().unwrap();
-            for (box_id, weak) in &sync.active_boxes_by_id {
+            for (box_id, weak) in &sync.active_handles_by_id {
                 if !seen_ids.contains(box_id)
                     && let Some(strong) = weak.upgrade()
                 {
@@ -578,14 +577,14 @@ impl RuntimeImpl {
 
             // Try as BoxID first
             if let Some(box_id) = BoxID::parse(id_or_name)
-                && let Some(weak) = sync.active_boxes_by_id.get(&box_id)
+                && let Some(weak) = sync.active_handles_by_id.get(&box_id)
                 && weak.upgrade().is_some()
             {
                 return Ok(true);
             }
 
             // Try as name
-            if let Some(weak) = sync.active_boxes_by_name.get(id_or_name)
+            if let Some(weak) = sync.active_handles_by_name.get(id_or_name)
                 && weak.upgrade().is_some()
             {
                 return Ok(true);
@@ -645,9 +644,10 @@ impl RuntimeImpl {
         // Collect all active non-detached boxes
         let active_boxes: Vec<SharedBoxImpl> = {
             let sync = self.sync_state.read().unwrap();
-            sync.active_boxes_by_id
+            sync.active_handles_by_id
                 .values()
                 .filter_map(|weak| weak.upgrade())
+                .map(|handle| handle.current())
                 .filter(|box_impl| !box_impl.config.options.detach)
                 .collect()
         };
@@ -791,14 +791,14 @@ impl RuntimeImpl {
 
             // Try as BoxID first
             if let Some(box_id) = BoxID::parse(id_or_name)
-                && let Some(weak) = sync.active_boxes_by_id.get(&box_id)
+                && let Some(weak) = sync.active_handles_by_id.get(&box_id)
                 && weak.upgrade().is_some()
             {
                 return Ok(box_id);
             }
 
             // Try as name
-            if let Some(weak) = sync.active_boxes_by_name.get(id_or_name)
+            if let Some(weak) = sync.active_handles_by_name.get(id_or_name)
                 && let Some(strong) = weak.upgrade()
             {
                 return Ok(strong.id().clone());
@@ -928,7 +928,7 @@ impl RuntimeImpl {
             }
 
             // Invalidate cache
-            self.invalidate_box_impl(id, config.name.as_deref());
+            self.invalidate_box_handle(id, config.name.as_deref());
 
             tracing::info!(box_id = %id, "Removed box");
             return Ok(());
@@ -937,9 +937,10 @@ impl RuntimeImpl {
         // Box not in database - check in-memory cache
         let box_impl = {
             let sync = self.sync_state.read().unwrap();
-            sync.active_boxes_by_id
+            sync.active_handles_by_id
                 .get(id)
                 .and_then(|weak| weak.upgrade())
+                .map(|handle| handle.current())
         };
 
         if let Some(box_impl) = box_impl {
@@ -975,7 +976,7 @@ impl RuntimeImpl {
             }
 
             // Invalidate cache (removes from in-memory maps)
-            self.invalidate_box_impl(id, box_impl.config.name.as_deref());
+            self.invalidate_box_handle(id, box_impl.config.name.as_deref());
 
             // Delete box directory + its socket binding symlink
             box_impl.config.sockets().remove();
@@ -1425,20 +1426,26 @@ impl RuntimeImpl {
     // INTERNAL - BOX IMPL CACHE
     // ========================================================================
 
-    /// Get existing BoxImpl from cache or create new one.
+    /// Create a fresh BoxImpl that is not installed in the handle cache.
+    fn create_box_impl(self: &Arc<Self>, config: BoxConfig, state: BoxState) -> SharedBoxImpl {
+        use crate::litebox::box_impl::BoxImpl;
+
+        let box_token = self.shutdown_token.child_token();
+        Arc::new(BoxImpl::new(config, state, Arc::clone(self), box_token))
+    }
+
+    /// Get existing BoxHandle from cache or create new one.
     ///
-    /// Returns `(SharedBoxImpl, inserted)` where `inserted` is true if a new BoxImpl
+    /// Returns `(SharedBoxHandle, inserted)` where `inserted` is true if a new BoxHandle
     /// was created, false if an existing one was returned.
     ///
     /// Checks both by name (if provided) and by ID. This prevents duplicate names
     /// even for boxes not yet persisted to database.
-    fn get_or_create_box_impl(
+    fn get_or_create_box_handle(
         self: &Arc<Self>,
         config: BoxConfig,
         state: BoxState,
-    ) -> (SharedBoxImpl, bool) {
-        use crate::litebox::box_impl::BoxImpl;
-
+    ) -> (SharedBoxHandle, bool) {
         let box_id = config.id.clone();
         let box_name = config.name.clone();
 
@@ -1446,54 +1453,55 @@ impl RuntimeImpl {
 
         // Check by name first (if provided) - prevents duplicate names
         if let Some(ref name) = box_name
-            && let Some(weak) = sync.active_boxes_by_name.get(name)
+            && let Some(weak) = sync.active_handles_by_name.get(name)
         {
             if let Some(strong) = weak.upgrade() {
-                tracing::trace!(name = %name, "Reusing cached BoxImpl by name");
+                tracing::trace!(name = %name, "Reusing cached BoxHandle by name");
                 return (strong, false);
             }
             // Dead weak ref, clean it up
-            sync.active_boxes_by_name.remove(name);
+            sync.active_handles_by_name.remove(name);
         }
 
         // Check by ID
-        if let Some(weak) = sync.active_boxes_by_id.get(&box_id) {
+        if let Some(weak) = sync.active_handles_by_id.get(&box_id) {
             if let Some(strong) = weak.upgrade() {
-                tracing::trace!(box_id = %box_id, "Reusing cached BoxImpl by ID");
+                tracing::trace!(box_id = %box_id, "Reusing cached BoxHandle by ID");
                 return (strong, false);
             }
             // Dead weak ref, clean it up
-            sync.active_boxes_by_id.remove(&box_id);
+            sync.active_handles_by_id.remove(&box_id);
         }
 
-        // Create new BoxImpl and cache in both maps
-        // Pass a child token so box can be cancelled independently or via runtime shutdown
-        let box_token = self.shutdown_token.child_token();
-        let box_impl = Arc::new(BoxImpl::new(config, state, Arc::clone(self), box_token));
-        let weak = Arc::downgrade(&box_impl);
+        // Create new BoxImpl, wrap it in a stable handle, and cache the handle
+        // in both maps.
+        let box_impl = self.create_box_impl(config, state);
+        let handle = Arc::new(BoxHandle::new(box_impl));
+        let weak = Arc::downgrade(&handle);
 
-        sync.active_boxes_by_id.insert(box_id.clone(), weak.clone());
+        sync.active_handles_by_id
+            .insert(box_id.clone(), weak.clone());
         if let Some(name) = box_name {
-            sync.active_boxes_by_name.insert(name.clone(), weak);
-            tracing::trace!(box_id = %box_id, name = %name, "Created and cached new BoxImpl");
+            sync.active_handles_by_name.insert(name.clone(), weak);
+            tracing::trace!(box_id = %box_id, name = %name, "Created and cached new BoxHandle");
         } else {
-            tracing::trace!(box_id = %box_id, "Created and cached new BoxImpl (unnamed)");
+            tracing::trace!(box_id = %box_id, "Created and cached new BoxHandle (unnamed)");
         }
 
-        (box_impl, true)
+        (handle, true)
     }
 
-    /// Remove BoxImpl from cache.
+    /// Remove BoxHandle from cache.
     ///
     /// Called when box is stopped or removed. Existing handles become stale;
-    /// new handles from runtime.get() will get a fresh BoxImpl.
-    pub(crate) fn invalidate_box_impl(&self, box_id: &BoxID, box_name: Option<&str>) {
+    /// new handles from runtime.get() will get a fresh BoxHandle.
+    pub(crate) fn invalidate_box_handle(&self, box_id: &BoxID, box_name: Option<&str>) {
         let mut sync = self.sync_state.write().unwrap();
-        sync.active_boxes_by_id.remove(box_id);
+        sync.active_handles_by_id.remove(box_id);
         if let Some(name) = box_name {
-            sync.active_boxes_by_name.remove(name);
+            sync.active_handles_by_name.remove(name);
         }
-        tracing::trace!(box_id = %box_id, name = ?box_name, "Invalidated BoxImpl cache");
+        tracing::trace!(box_id = %box_id, name = ?box_name, "Invalidated BoxHandle cache");
     }
 
     /// Acquire coordination lock for multi-step atomic operations.
