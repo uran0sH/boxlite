@@ -109,10 +109,22 @@ impl Sandbox for BwrapSandbox {
         // =====================================================================
         // Environment sanitization
         // =====================================================================
+        // The statically-linked shim dlopen's libkrunfw via LD_LIBRARY_PATH (its
+        // `$ORIGIN` rpath is ineffective), and `--clearenv` wipes it — without
+        // this the VM fails to start ("Couldn't find or load libkrunfw.so.5",
+        // libkrun status=-2). Point it at the shim's own directory (`<box>/bin`),
+        // which is bound into the sandbox and is exactly where `copy_libkrunfw`
+        // placed the library the shim loads.
+        let shim_dir = std::path::Path::new(&binary)
+            .parent()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
         bwrap_cmd
             .with_clearenv()
             .setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .setenv("HOME", "/root");
+            .setenv("HOME", "/root")
+            .setenv("LD_LIBRARY_PATH", shim_dir);
 
         // Preserve debugging environment variables
         if let Ok(rust_log) = std::env::var("RUST_LOG") {
@@ -141,5 +153,54 @@ impl Sandbox for BwrapSandbox {
 
     fn name(&self) -> &'static str {
         "bwrap"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::advanced_options::ResourceLimits;
+
+    /// The shim is statically linked, so libkrun's `dlopen` of `libkrunfw.so.5`
+    /// can only be satisfied via `LD_LIBRARY_PATH` inside the `--clearenv`
+    /// sandbox — the shim's `$ORIGIN` rpath is absent and the inherited
+    /// `LD_LIBRARY_PATH` is wiped by `--clearenv`. Without this the VM fails to
+    /// start ("Couldn't find or load libkrunfw.so.5", libkrun status=-2). This
+    /// guards the env var the composable `apply()` dropped relative to the
+    /// legacy `build_shim_command`.
+    #[test]
+    fn apply_sets_ld_library_path_to_shim_dir() {
+        if !bwrap::is_available() {
+            eprintln!("skipping apply_sets_ld_library_path_to_shim_dir: bwrap not available");
+            return;
+        }
+
+        let limits = Box::leak(Box::new(ResourceLimits::default()));
+        let ctx = SandboxContext {
+            id: "test-box",
+            paths: vec![],
+            resource_limits: limits,
+            network_enabled: false,
+            sandbox_profile: None,
+        };
+
+        let shim = "/var/lib/boxlite/boxes/abc/bin/boxlite-shim";
+        let mut cmd = Command::new(shim);
+        BwrapSandbox::new().apply(&ctx, &mut cmd);
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        let pos = args
+            .windows(3)
+            .position(|w| w[0] == "--setenv" && w[1] == "LD_LIBRARY_PATH")
+            .expect("bwrap must --setenv LD_LIBRARY_PATH so the static shim can dlopen libkrunfw");
+        assert_eq!(
+            args[pos + 2],
+            "/var/lib/boxlite/boxes/abc/bin",
+            "LD_LIBRARY_PATH must point at the shim's own directory (where libkrunfw is copied)"
+        );
     }
 }
